@@ -1,3 +1,4 @@
+import torch
 import ast
 from ast import parse, get_source_segment, unparse
 from typing import Dict, List, Tuple, Any, Iterable, Set, get_type_hints
@@ -6,6 +7,7 @@ from inspect import getclosurevars, getsource, getfullargspec, FullArgSpec
 
 class NamedTensor:
     def __init__(self, *dimensions, need_contiguous=False, **kwargs):
+        # super(NamedTensor, self).__init__(torch.zeros(1))
         self.dimensions = dimensions
         self.need_contiguous = need_contiguous
 
@@ -26,6 +28,35 @@ def ast_sum(*terms):
     return ast_bin_op(*terms, op=ast.Add())
 
 
+def ast_len(c):
+    return ast.Call(ast.Name('len', ast.Load()), [c], [])
+
+
+class Axis:
+    def __init__(self, dims: Tuple[str, ...], reduced: bool):
+        self.dims = dims
+        self.reduced = reduced
+        self.block_size = None
+
+    def block_size_name(self):
+        return '_'.join(self.dims).upper() + '_BS'
+
+    def size_name(self):
+        return '_'.join(self.dims) + '_size'
+
+    def ast_block_size(self):
+        return ast.Name(self.block_size_name(), ast.Load())
+
+    def ast_block_size_arg(self):
+        return ast.arg(self.block_size_name(), ast.Attribute(ast.Name("tl", ast.Load()), 'constexpr'))
+
+    def ast_size(self):
+        return ast.Name(self.size_name(), ast.Load())
+
+    def ast_meta_block_size(self):
+        return ast.Subscript(ast.Name('meta', ast.Load()), ast.Constant(self.block_size_name()), ast.Load())
+
+
 class TensorArgument:
     def __init__(self, name, dims, axes, need_contiguous=False):
         self.name = name
@@ -33,24 +64,35 @@ class TensorArgument:
         self.axes = axes
         self.need_contiguous = need_contiguous
 
+    def ast_name(self):
+        return ast.Name(self.name, ast.Load())
+
+    def ast_attr(self, attr):
+        return ast.Attribute(self.ast_name(), attr, ast.Load())
+
     def ast_get_shape(self, i):
         return ast.Subscript(
-            ast.Attribute(
-                ast.Name(self.name, ast.Load()),
-                'shape', ast.Load()),
+            self.ast_attr('shape'),
             ast.Constant(i), ast.Load())
 
     def ast_get_stride(self, i):
         return ast.Call(
-            ast.Attribute(
-                ast.Name(self.name, ast.Load()),
-                'stride', ast.Load()),
+            self.ast_attr('stride'),
             [ast.Constant(i)], [])
 
-    def prepare_args(self):
-        result = [ast.Assert(ast.Compare(self.ast_get_shape(i), [ast.Eq()], [ast.Constant(len(dim))]))
-                  for i, dim in enumerate(self.dims)
-                  if isinstance(dim, list)]
+    def prepare_args(self, with_assert=True):
+        if not with_assert:
+            return []
+        dim_len = len(self.dims)
+        result = (
+            [ast.Assert(
+                ast.Compare(ast_len(self.ast_attr('shape')), [ast.Eq()], [ast.Constant(dim_len)]),
+                ast.Constant(f'Shape of {self.name} must have len {dim_len}'))] +
+            [ast.Assert(
+                ast.Compare(self.ast_get_shape(i), [ast.Eq()], [ast.Constant(len(dim))]),
+                ast.Constant(f'Dim {i} of {self.name} must have size {len(dim)} for fields: {", ".join(dim)}'))
+             for i, dim in enumerate(self.dims)
+             if isinstance(dim, list)])
         if self.need_contiguous:
             result.append(ast.Assert(
                 ast.Call(
@@ -121,13 +163,12 @@ class TensorArgument:
         )
 
 
-def ast_grid_dim(dim):
-    ds = '_'.join(dim)
+def ast_grid_dim(axis: Axis):
     return ast.Call(
         ast.Attribute(ast.Name('triton', ast.Load()), 'cdiv', ast.Load()),
         [
-            ast.Name(ds + '_size', ast.Load()),
-            ast.Subscript(ast.Name('meta', ast.Load()), ast.Constant('BLOCK_SIZE_' + ds.upper()), ast.Load())
+            axis.ast_size(),
+            axis.ast_meta_block_size()
         ],
         []
     )
@@ -135,12 +176,12 @@ def ast_grid_dim(dim):
 
 def make_grid_lambda(axes):
     return ast.Lambda(
-        ast.arguments([], [ast.arg('meta')], [], [], [], [], []),
+        ast.arguments([], [ast.arg('meta')], None, [], [], None, []),
         ast.Tuple([
             ast_product(*[
                 ast_grid_dim(a)
-                for a, r in axes.items()
-                if not r
+                for a in axes.values()
+                if not a.reduced
             ])
         ], ast.Load()))
 
@@ -157,16 +198,15 @@ def ast_get_axis_shapes(axis: Tuple[str, ...], args: Iterable[TensorArgument]):
     return result
 
 
-def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, TensorArgument]):
+def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, TensorArgument], with_assert=True):
     parsed_args = parsed_func.args
     body = [
-        # assert tensor.is_cuda
         ast.Assert(ast.BoolOp(ast.And(),
-                              [ast.Attribute(ast.Name(a, ast.Load), "is_cuda", ast.Load())
+                              [ast.Attribute(ast.Name(a, ast.Load()), "is_cuda", ast.Load())
                                for a in tensor_args.keys()]))
-    ]
+    ] if with_assert else []
     for ta in tensor_args.values():
-        body.extend(ta.prepare_args())
+        body.extend(ta.prepare_args(with_assert))
     kernel_args = []
     for a in parsed_args.args:
         ta = tensor_args.get(a.arg, None)
@@ -181,7 +221,7 @@ def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, Tens
             [ast.Name(size, ast.Store())],
             shapes[0]
         ))
-        if len(shapes) > 1:
+        if with_assert and len(shapes) > 1:
             body.append(ast.Assert(ast.Compare(
                 ast.Name(size, ast.Load()),
                 [ast.Eq()] * (len(shapes) - 1),
@@ -189,20 +229,23 @@ def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, Tens
             )))
     body.extend([
         ast.Assign(
-            [ast.Name('__grid__', ast.Store())],
-            make_grid_lambda(axes)),
+             [ast.Name('__grid__', ast.Store())],
+             make_grid_lambda(axes)),
         ast.Expr(ast.Call(
             ast.Subscript(
                 ast.Name(parsed_func.name + "_kernel", ctx=ast.Load()),
-                ast.Name('__grid__', ast.Load())
+                ast.Name('__grid__', ast.Load()),
+                ast.Load()
             ),
             kernel_args,
-            []))
+            [ast.keyword(a.block_size_name(), ast.Constant(a.block_size))
+             for a in axes.values()]))
     ])
     wrapper = ast.FunctionDef(parsed_func.name,
                               ast.arguments(
                                   parsed_args.posonlyargs,
-                                  [ast.arg(a.arg, ast.Name("torch.Tensor", ast.Load())) if a.arg in tensor_args else a
+                                  [ast.arg(a.arg, ast.Attribute(ast.Name("torch", ast.Load()), 'Tensor', ast.Load()))
+                                   if a.arg in tensor_args else a
                                    for a in parsed_args.args],
                                   parsed_args.vararg,
                                   parsed_args.kwonlyargs,
@@ -210,7 +253,9 @@ def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, Tens
                                   parsed_args.kwarg,
                                   parsed_args.defaults,
                                 ),
-                              body, [])
+                              # [ast.Expr(ast.Call(ast.Name('print', ast.Load()), [ast.Name('bars', ast.Load())], []))],
+                              body,
+                              [])
     setattr(wrapper, 'lineno', parsed_func.lineno)
     ast.fix_missing_locations(wrapper)
     return wrapper
@@ -327,6 +372,8 @@ def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, tensor_args: Di
             args.append(a)
         else:
             args.extend(ta.kernel_args_def())
+    for a in axes.values():
+        args.append(a.ast_block_size_arg())
 
     replacer = TensorArgumentReplacer(tensor_args)
     init_body = (
@@ -366,7 +413,7 @@ def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, tensor_args: Di
     return kernel
 
 
-def distribute_axes(annotations, reduced):
+def distribute_axes(annotations, reduced) -> Dict[Tuple[str, ...], Axis]:
     dims = [tp.dimensions for name, tp in annotations.items() if isinstance(tp, NamedTensor)]
     seqs = set()
     for d in dims:
@@ -402,33 +449,43 @@ def distribute_axes(annotations, reduced):
             item = [d]
             while n is not None:
                 item.append(n)
-                n = seq_map[n]
+                n = seq_map[n][1]
             result.append(tuple(item))
-    return {r: r in reduced for r in result}
+    return {r: Axis(r, r in reduced) for r in result}
 
 
-def tritonize(f):
-    print('hints:', get_type_hints(f))
-    args = getfullargspec(f)
-    source = getsource(f)
-    parsed = parse(source).body[0]
-    all_dims = {
-        dim
-        for name, tp in args.annotations.items() if isinstance(tp, NamedTensor)
-        for dim in tp.dimensions if isinstance(dim, str)
-    }
-    reduced_axes = ReductionFinder.find_axes(parsed, all_dims)
+def tritonize(DEFAULT_BS=None, **kwargs):
+    def decorator(f):
+        print('hints:', get_type_hints(f))
+        args = getfullargspec(f)
+        source = getsource(f)
+        parsed = parse(source).body[0]
+        all_dims = {
+            dim
+            for name, tp in args.annotations.items() if isinstance(tp, NamedTensor)
+            for dim in tp.dimensions if isinstance(dim, str)
+        }
+        reduced_axes = ReductionFinder.find_axes(parsed, all_dims)
 
-    axes = distribute_axes(args.annotations, reduced_axes)
-    assert len([1 for r in axes.values() if not r]) <= 3
-    tensor_args = {name: TensorArgument(name, tp.dimensions, axes, need_contiguous=tp.need_contiguous)
-                   for name, tp in args.annotations.items()
-                   if isinstance(tp, NamedTensor)}
+        axes = distribute_axes(args.annotations, reduced_axes)
+        for a in axes.values():
+            a.block_size = kwargs.get(a.block_size_name(), DEFAULT_BS)
 
-    wrapper = make_wrapper(parsed, axes, tensor_args)
-    print('wrapper:\n', unparse(wrapper))
+        assert len([1 for r in axes.values() if not r]) <= 3
+        tensor_args = {name: TensorArgument(name, tp.dimensions, axes, need_contiguous=tp.need_contiguous)
+                       for name, tp in args.annotations.items()
+                       if isinstance(tp, NamedTensor)}
+        #block_sizes =
+        wrapper = make_wrapper(parsed, axes, tensor_args)
+        print('wrapper:\n', unparse(wrapper))
 
-    kernel = make_kernel(parsed, args, tensor_args, axes)
-    print('kernel:\n', unparse(kernel))
+        kernel = make_kernel(parsed, args, tensor_args, axes)
+        print('kernel:\n', unparse(kernel))
 
-    print()
+        # print(ast.dump(wrapper, indent=4))
+
+        code = compile(ast.Module([wrapper], []), '<string>', 'exec')
+        namespace = {'torch': torch}
+        exec(code, namespace)
+        return namespace[parsed.name]
+    return decorator
