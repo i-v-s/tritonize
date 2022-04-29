@@ -1,8 +1,14 @@
+from typing import Dict, List, Tuple, Any, Iterable, Set, Optional, get_type_hints
+from copy import copy
+
 import torch
+import triton
+import triton.language as tl
+
 import ast
 from ast import parse, get_source_segment, unparse
-from typing import Dict, List, Tuple, Any, Iterable, Set, get_type_hints
 from inspect import getclosurevars, getsource, getfullargspec, FullArgSpec
+import linecache
 
 
 class NamedTensor:
@@ -10,6 +16,27 @@ class NamedTensor:
         # super(NamedTensor, self).__init__(torch.zeros(1))
         self.dimensions = dimensions
         self.need_contiguous = need_contiguous
+
+
+class Globals:
+    def __init__(self, globs):
+        self.globals = copy(globs)
+        self.tl = 'tl'
+        self.triton = 'triton'
+        self.torch = 'torch'
+        for k, v in self.globals.items():
+            if v is triton:
+                self.triton = k
+            if v is tl:
+                self.tl = k
+            if v is torch:
+                self.torch = k
+
+    def ast_tl(self, attr):
+        return ast.Attribute(ast.Name(self.tl, ast.Load()), attr, ast.Load())
+
+    def ast_triton(self, attr):
+        return ast.Attribute(ast.Name(self.triton, ast.Load()), attr, ast.Load())
 
 
 def ast_bin_op(a1, *args, op=None):
@@ -37,6 +64,7 @@ class Axis:
         self.dims = dims
         self.reduced = reduced
         self.block_size = None
+        self.g: Optional[Globals] = None
 
     def block_size_name(self):
         return '_'.join(self.dims).upper() + '_BS'
@@ -48,7 +76,7 @@ class Axis:
         return ast.Name(self.block_size_name(), ast.Load())
 
     def ast_block_size_arg(self):
-        return ast.arg(self.block_size_name(), ast.Attribute(ast.Name("tl", ast.Load()), 'constexpr'))
+        return ast.arg(self.block_size_name(), self.g.ast_tl('constexpr'))
 
     def ast_size(self):
         return ast.Name(self.size_name(), ast.Load())
@@ -58,10 +86,11 @@ class Axis:
 
 
 class TensorArgument:
-    def __init__(self, name, dims, axes, need_contiguous=False):
+    def __init__(self, name, dims, axes, globs: Globals, need_contiguous=False):
         self.name = name
         self.dims = dims
         self.axes = axes
+        self.g = globs
         self.need_contiguous = need_contiguous
 
     def ast_name(self):
@@ -149,14 +178,14 @@ class TensorArgument:
 
     def ast_store(self, value, field=None):
         return ast.Call(
-            ast.Attribute(ast.Name('tl', ast.Load()), 'store'),
+            self.g.ast_tl('store'),
             [self.ast_pointer(), value],
             [ast.keyword('mask', ast.Name('mask', ast.Load()))]
         )
 
     def ast_load(self, field=None):
         return ast.Call(
-            ast.Attribute(ast.Name('tl', ast.Load()), 'load'),
+            self.g.ast_tl('load'),
             [self.ast_pointer(field)],
             [ast.keyword('mask', ast.Name('mask', ast.Load())),
              ast.keyword('other', ast.Name('other', ast.Load()))]
@@ -253,11 +282,8 @@ def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, Tens
                                   parsed_args.kwarg,
                                   parsed_args.defaults,
                                 ),
-                              # [ast.Expr(ast.Call(ast.Name('print', ast.Load()), [ast.Name('bars', ast.Load())], []))],
                               body,
                               [])
-    setattr(wrapper, 'lineno', parsed_func.lineno)
-    ast.fix_missing_locations(wrapper)
     return wrapper
 
 
@@ -364,7 +390,7 @@ def trace_variables(body: List[Any], args):
     # return result
 
 
-def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, tensor_args: Dict[str, TensorArgument], axes):
+def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, globs: Globals, tensor_args: Dict[str, TensorArgument], axes):
     args = []
     for a in parsed_func.args.args:
         ta = tensor_args.get(a.arg, None)
@@ -381,7 +407,7 @@ def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, tensor_args: Di
             ast.Assign(
                 [ast.Name('_'.join(a) + '_i', ast.Store())],
                 ast.Call(
-                    ast.Attribute(ast.Name('tl', ast.Load()), 'program_id'),
+                    globs.ast_tl('program_id'),
                     [], [ast.keyword('axis', ast.Constant(i))]
                 )
             )
@@ -391,7 +417,7 @@ def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, tensor_args: Di
             ast.Assign(
                 [ast.Name('_'.join(a) + '_i', ast.Store())],
                 ast.Call(
-                    ast.Attribute(ast.Name('tl', ast.Load()), 'arange'),
+                    globs.ast_tl('arange'),
                     [ast.Constant(0), ast.Name('BLOCK_SIZE_' + '_'.join(a).upper(), ast.Load())], []
                 )
             )
@@ -406,10 +432,8 @@ def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, tensor_args: Di
         ])
     body = [replacer.visit(node) for node in parsed_func.body]
     kernel = ast.FunctionDef(parsed_func.name + '_kernel',
-                             ast.arguments([], args, [], [], [], [], []),
-                             init_body + body, [])
-    setattr(kernel, 'lineno', parsed_func.lineno)
-    ast.fix_missing_locations(kernel)
+                             ast.arguments([], args, None, [], [], None, []),
+                             init_body + body, [globs.ast_triton('jit')])
     return kernel
 
 
@@ -454,8 +478,20 @@ def distribute_axes(annotations, reduced) -> Dict[Tuple[str, ...], Axis]:
     return {r: Axis(r, r in reduced) for r in result}
 
 
-def tritonize(DEFAULT_BS=None, **kwargs):
+def patch_cache(name, code):
+    getlines = linecache.getlines
+
+    def monkey_patch(filename, module_globals=None):
+        if filename == name:
+            return code.splitlines(keepends=True)
+        else:
+            return getlines(filename, module_globals)
+    linecache.getlines = monkey_patch
+
+
+def tritonize(save_to: Optional[str] = None, DEFAULT_BS=None, **kwargs):
     def decorator(f):
+        globs = Globals(f.__globals__)
         print('hints:', get_type_hints(f))
         args = getfullargspec(f)
         source = getsource(f)
@@ -470,22 +506,29 @@ def tritonize(DEFAULT_BS=None, **kwargs):
         axes = distribute_axes(args.annotations, reduced_axes)
         for a in axes.values():
             a.block_size = kwargs.get(a.block_size_name(), DEFAULT_BS)
+            a.g = globs
 
         assert len([1 for r in axes.values() if not r]) <= 3
-        tensor_args = {name: TensorArgument(name, tp.dimensions, axes, need_contiguous=tp.need_contiguous)
+        tensor_args = {name: TensorArgument(name, tp.dimensions, axes, globs, need_contiguous=tp.need_contiguous)
                        for name, tp in args.annotations.items()
                        if isinstance(tp, NamedTensor)}
-        #block_sizes =
+
+        kernel = make_kernel(parsed, args, globs, tensor_args, axes)
         wrapper = make_wrapper(parsed, axes, tensor_args)
-        print('wrapper:\n', unparse(wrapper))
+        module = ast.Module([kernel, wrapper], [])
+        ast.fix_missing_locations(module)
 
-        kernel = make_kernel(parsed, args, tensor_args, axes)
-        print('kernel:\n', unparse(kernel))
+        code = ast.unparse(module)
+        print(code)
 
-        # print(ast.dump(wrapper, indent=4))
-
-        code = compile(ast.Module([wrapper], []), '<string>', 'exec')
-        namespace = {'torch': torch}
-        exec(code, namespace)
-        return namespace[parsed.name]
+        #print(ast.dump(wrapper, indent=4))
+        if save_to is not None:
+            # TODO save
+            module_file = save_to
+        else:
+            module_file = f'<{parsed.name}_kernel>'
+            patch_cache(module_file, code)
+        compiled = compile(module, module_file, 'exec')
+        exec(compiled, globs.globals)
+        return globs.globals[parsed.name]
     return decorator
