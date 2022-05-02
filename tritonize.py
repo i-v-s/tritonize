@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Any, Iterable, Set, Optional, get_type_hints
+from typing import Dict, List, Tuple, Any, Iterable, Set, Optional, NamedTuple, get_type_hints
 from copy import copy
 
 import torch
@@ -38,6 +38,42 @@ class Globals:
     def ast_triton(self, attr):
         return ast.Attribute(ast.Name(self.triton, ast.Load()), attr, ast.Load())
 
+    def cdiv(self, a: ast.expr, b: ast.expr):
+        return ast.Call(self.ast_tl('cdiv'), [a, b], [])
+
+
+class Writer:
+    def __init__(self, ns=None):
+        self.ns = ns or set()
+        self.body = []
+
+    def init(self, var: str, value: ast.expr) -> ast.Name:
+        if var in self.ns:
+            raise ValueError(f'Attempt of variable reinitialization {var}')
+        self.body.append(ast.Assign([ast.Name(var, ast.Store())], value))
+        self.ns.add(var)
+        return ast.Name(var, ast.Load())
+
+    def aug_assign(self, target: str, op: ast.operator, value: ast.expr):
+        assert target in self.ns
+        self.body.append(ast.AugAssign(ast.Name(target, ast.Store()), op, value))
+
+    def assert_(self, *args, msg: Optional[str] = None):
+        if args:
+            self.body.append(
+                ast.Assert(
+                    ast.BoolOp(ast.And(), list(args)) if len(args) > 1 else args[0],
+                    ast.Constant(msg)))
+
+    def assert_eq(self, arg, *args, msg: Optional[str] = None):
+        self.body.append(
+            ast.Assert(
+                ast.Compare(arg, [ast.Eq()] * len(args), list(args)),
+                ast.Constant(msg)))
+
+    def call(self, *args, **kwargs):
+        self.body.append(ast.Expr(ast.Call(*args, **kwargs)))
+
 
 def ast_bin_op(a1, *args, op=None):
     if args:
@@ -59,39 +95,91 @@ def ast_len(c):
     return ast.Call(ast.Name('len', ast.Load()), [c], [])
 
 
-class Axis:
-    def __init__(self, dims: Tuple[str, ...], reduced: bool):
-        self.dims = dims
-        self.reduced = reduced
-        self.block_size = None
-        self.g: Optional[Globals] = None
+class AxisVars(NamedTuple):
+    index: ast.AST
+    mask: ast.AST
 
-    def block_size_name(self):
-        return '_'.join(self.dims).upper() + '_BS'
+
+class Axis:
+    def __init__(self, dims: Tuple[str, ...], block_size: int, globs: Globals, *, one_block=False, no_mask=False):
+        self.dims = dims
+        self.name = '_'.join(dims)
+        self.block_size = block_size
+        self.g = globs
+        # Flags:
+        self.one_block = one_block
+        self.no_mask = no_mask
+        # Initialized vars:
+        self.index: Optional[ast.Name] = None
+        self.mask:  Optional[ast.Name] = None
+
+    def __str__(self):
+        return self.name
+
+    @staticmethod
+    def block_size_name_(dims: Tuple[str, ...]) -> str:
+        return '_'.join(dims).upper() + '_BS'
+
+    def block_size_name(self) -> str:
+        return Axis.block_size_name_(self.dims)
 
     def size_name(self):
         return '_'.join(self.dims) + '_size'
 
-    def ast_block_size(self):
+    def ast_block_size(self) -> ast.Name:
         return ast.Name(self.block_size_name(), ast.Load())
 
     def ast_block_size_arg(self):
         return ast.arg(self.block_size_name(), self.g.ast_tl('constexpr'))
 
-    def ast_size(self):
+    def ast_size(self) -> ast.Name:
         return ast.Name(self.size_name(), ast.Load())
 
     def ast_meta_block_size(self):
         return ast.Subscript(ast.Name('meta', ast.Load()), ast.Constant(self.block_size_name()), ast.Load())
 
+    def init_kernel(self, writer: Writer, pid: str):
+        name = '_'.join(self.dims)
+        if self.one_block:
+            self.index = writer.init(
+                name + '_i',
+                ast.Call(self.g.ast_tl('arange'), [ast.Constant(0), self.ast_block_size()], []))
+        else:
+            blocks = writer.init(self.name + '_blocks', self.g.cdiv(self.ast_size(), self.ast_block_size()))
+            self.index = writer.init(name + '_i', ast.BinOp(ast.Name(pid, ast.Load()), ast.Mod(), blocks))
+            writer.aug_assign(pid, ast.FloorDiv(), blocks)
+        if not self.no_mask:
+            self.mask = writer.init(
+                name + '_m',
+                ast.Compare(self.index, [ast.Lt()], [self.ast_size()]))
+
+    def ast_grid_dim(self):
+        return self.g.cdiv(self.ast_size(), self.ast_meta_block_size())
+
 
 class TensorArgument:
-    def __init__(self, name, dims, axes, globs: Globals, need_contiguous=False):
+    def __init__(self, name, dims, axes: List[Axis], globs: Globals, need_contiguous=False):
         self.name = name
         self.dims = dims
-        self.axes = axes
+        self.axes = self.choose_axes(axes)
         self.g = globs
         self.need_contiguous = need_contiguous
+
+    def choose_axes(self, axes: List[Axis]):
+        buf = ()
+        axes = {a.dims: a for a in axes}
+        result = []
+        for dim in self.dims:
+            if isinstance(dim, list):
+                assert not buf
+            else:
+                buf += (dim,)
+                axis = axes.get(buf, None)
+                if axis is not None:
+                    result.append(axis)
+                    buf = ()
+        assert not buf
+        return result
 
     def ast_name(self):
         return ast.Name(self.name, ast.Load())
@@ -109,65 +197,57 @@ class TensorArgument:
             self.ast_attr('stride'),
             [ast.Constant(i)], [])
 
-    def prepare_args(self, with_assert=True):
+    def prepare_args(self, writer: Writer, with_assert=True):
         if not with_assert:
-            return []
+            return
         dim_len = len(self.dims)
-        result = (
-            [ast.Assert(
-                ast.Compare(ast_len(self.ast_attr('shape')), [ast.Eq()], [ast.Constant(dim_len)]),
-                ast.Constant(f'Shape of {self.name} must have len {dim_len}'))] +
-            [ast.Assert(
-                ast.Compare(self.ast_get_shape(i), [ast.Eq()], [ast.Constant(len(dim))]),
-                ast.Constant(f'Dim {i} of {self.name} must have size {len(dim)} for fields: {", ".join(dim)}'))
-             for i, dim in enumerate(self.dims)
-             if isinstance(dim, list)])
+        writer.assert_eq(
+            ast_len(self.ast_attr('shape')), ast.Constant(dim_len),
+            msg=f'Shape of {self.name} must have len {dim_len}')
+        for i, dim in enumerate(self.dims):
+            if isinstance(dim, list):
+                writer.assert_eq(
+                    self.ast_get_shape(i), ast.Constant(len(dim)),
+                    msg=f'Dim {i} of {self.name} must have size {len(dim)} for fields: {", ".join(dim)}')
         if self.need_contiguous:
-            result.append(ast.Assert(
+            writer.assert_(
                 ast.Call(
                     ast.Attribute(
                         ast.Name(self.name, ast.Load()),
                         'is_contiguous', ast.Load()),
                     [], []
-                )
-            ))
-        return result
+                ),
+                msg=f'{self.name} must be contiguous'
+            )
 
-    def axis_indices(self, axis: Tuple[str, ...]):
-        try:
-            i = self.dims.index(axis[0])
-            assert axis == self.dims[i:i + len(axis)]
-            return range(i, i + len(axis))
-        except ValueError:
-            return None
+    def axis_ranges(self):
+        i = 0
+        for axis in self.axes:
+            j = i + len(axis.dims)
+            yield axis, range(i, j)
+            i = j
 
     def ast_kernel_args(self):
         result = [ast.Name(self.name, ast.Load())]
         if not self.need_contiguous:
-            for axis in self.axes:
-                indices = self.axis_indices(axis)
-                if indices is not None:
-                    result.append(ast_product(*[self.ast_get_stride(i) for i in indices]))
+            for axis, r in self.axis_ranges():
+                result.append(ast_product(*map(self.ast_get_stride, r)))
         return result
 
     def kernel_args_def(self):
         result = [ast.arg(self.name + '_ptr')]
         if not self.need_contiguous:
             for axis in self.axes:
-                indices = self.axis_indices(axis)
-                if indices is not None:
-                    result.append(ast.arg(self.name + '_' + '_'.join(axis) + '_stride'))
+                result.append(ast.arg(self.name + '_' + axis.name + '_stride'))
         return result
 
     def ast_calc_pointer(self):
         offsets = []
         for axis in self.axes:
-            indices = self.axis_indices(axis)
-            if indices is not None:
-                offsets.append(ast_product(
-                    ast.Name('_'.join(axis) + '_i', ast.Load()),
-                    ast.Name(self.name + '_' + '_'.join(axis) + '_stride', ast.Load())
-                ))
+            offsets.append(ast_product(
+                ast.Name(f'{axis}_i', ast.Load()),
+                ast.Name(f'{self.name}_{axis}_stride', ast.Load())
+            ))
         return ast_sum(ast.Name(self.name + '_ptr', ast.Load()), *offsets)
 
     def ast_pointer(self, field=None):
@@ -177,65 +257,55 @@ class TensorArgument:
         return result
 
     def ast_store(self, value, field=None):
+        kwargs = {}
+
         return ast.Call(
             self.g.ast_tl('store'),
             [self.ast_pointer(), value],
-            [ast.keyword('mask', ast.Name('mask', ast.Load()))]
+            [ast.keyword(k, v) for k, v in kwargs.items()]
         )
 
     def ast_load(self, field=None):
+        kwargs = {}
+        # if self.mask is not None:
+            # kwargs.append(ast.keyword('mask', ast.Name('mask', ast.Load())))
+            # kwargs.append(ast.keyword('other', ast.Name('other', ast.Load())))
         return ast.Call(
             self.g.ast_tl('load'),
             [self.ast_pointer(field)],
-            [ast.keyword('mask', ast.Name('mask', ast.Load())),
-             ast.keyword('other', ast.Name('other', ast.Load()))]
+            [ast.keyword(k, v) for k, v in kwargs.items()]
         )
 
 
-def ast_grid_dim(axis: Axis):
-    return ast.Call(
-        ast.Attribute(ast.Name('triton', ast.Load()), 'cdiv', ast.Load()),
-        [
-            axis.ast_size(),
-            axis.ast_meta_block_size()
-        ],
-        []
-    )
-
-
-def make_grid_lambda(axes):
+def make_grid_lambda(axes: Iterable[Axis]):
     return ast.Lambda(
         ast.arguments([], [ast.arg('meta')], None, [], [], None, []),
         ast.Tuple([
             ast_product(*[
-                ast_grid_dim(a)
-                for a in axes.values()
-                if not a.reduced
+                a.ast_grid_dim()
+                for a in axes
+                if not a.one_block
             ])
         ], ast.Load()))
 
 
-def ast_get_axis_shapes(axis: Tuple[str, ...], args: Iterable[TensorArgument]):
-    result = []
+def ast_get_axes_shapes(axes: Iterable[Axis], args: Iterable[TensorArgument]):
+    result = {a: [] for a in axes}
     for arg in args:
-        indices = arg.axis_indices(axis)
-        if indices is not None:
-            result.append(ast_product(*[
-                arg.ast_get_shape(j)
-                for j in indices
-            ]))
+        for axis, indices in arg.axis_ranges():
+            result[axis].append(ast_product(*map(arg.ast_get_shape, indices)))
     return result
 
 
 def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, TensorArgument], with_assert=True):
     parsed_args = parsed_func.args
-    body = [
-        ast.Assert(ast.BoolOp(ast.And(),
-                              [ast.Attribute(ast.Name(a, ast.Load()), "is_cuda", ast.Load())
-                               for a in tensor_args.keys()]))
-    ] if with_assert else []
+    writer = Writer()
+    if with_assert:
+        writer.assert_(
+            *[ast.Attribute(ast.Name(a, ast.Load()), "is_cuda", ast.Load()) for a in tensor_args.keys()],
+            msg='All tensors must be stored in GPU')
     for ta in tensor_args.values():
-        body.extend(ta.prepare_args(with_assert))
+        ta.prepare_args(writer, with_assert)
     kernel_args = []
     for a in parsed_args.args:
         ta = tensor_args.get(a.arg, None)
@@ -243,33 +313,22 @@ def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, Tens
             kernel_args.append(ast.Name(a.arg, ast.Load()))
         else:
             kernel_args.extend(ta.ast_kernel_args())
-    for axis in axes:
-        size = '_'.join(axis) + '_size'
-        shapes = ast_get_axis_shapes(axis, tensor_args.values())
-        body.append(ast.Assign(
-            [ast.Name(size, ast.Store())],
-            shapes[0]
-        ))
+    for axis, shapes in ast_get_axes_shapes(axes, tensor_args.values()).items():
+        size = writer.init(axis.size_name(), shapes[0])
         if with_assert and len(shapes) > 1:
-            body.append(ast.Assert(ast.Compare(
-                ast.Name(size, ast.Load()),
-                [ast.Eq()] * (len(shapes) - 1),
-                shapes[1:]
-            )))
-    body.extend([
-        ast.Assign(
-             [ast.Name('__grid__', ast.Store())],
-             make_grid_lambda(axes)),
-        ast.Expr(ast.Call(
-            ast.Subscript(
-                ast.Name(parsed_func.name + "_kernel", ctx=ast.Load()),
-                ast.Name('__grid__', ast.Load()),
-                ast.Load()
-            ),
-            kernel_args,
-            [ast.keyword(a.block_size_name(), ast.Constant(a.block_size))
-             for a in axes.values()]))
-    ])
+            writer.assert_eq(size, *shapes[1:], msg=f'{size.id} not equal on tensors')
+        kernel_args.append(size)
+    grid = writer.init('__grid__', make_grid_lambda(axes))
+    writer.call(
+        ast.Subscript(
+            ast.Name(parsed_func.name + "_kernel", ctx=ast.Load()),
+            grid,
+            ast.Load()
+        ),
+        kernel_args,
+        [ast.keyword(a.block_size_name(), ast.Constant(a.block_size))
+         for a in axes]
+    )
     wrapper = ast.FunctionDef(parsed_func.name,
                               ast.arguments(
                                   parsed_args.posonlyargs,
@@ -282,7 +341,7 @@ def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, Tens
                                   parsed_args.kwarg,
                                   parsed_args.defaults,
                                 ),
-                              body,
+                              writer.body,
                               [])
     return wrapper
 
@@ -316,11 +375,11 @@ class TensorArgumentReplacer(ast.NodeTransformer):
         if len(targets) == 1:
             target = targets[0]
             if isinstance(target, ast.Name) and target.id in self.args:
-                return ast.Expr(self.args[target.id].ast_store(self.generic_visit(node.value)))
+                return ast.Expr(self.args[target.id].ast_store(self.visit(node.value)))
             elif isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
                 arg = self.args.get(target.value.id, None)
                 if arg is not None:
-                    return ast.Expr(arg.ast_store(self.generic_visit(node.value), field=target.attr))
+                    return ast.Expr(arg.ast_store(self.visit(node.value), field=target.attr))
         return self.generic_visit(node)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> Any:
@@ -390,7 +449,8 @@ def trace_variables(body: List[Any], args):
     # return result
 
 
-def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, globs: Globals, tensor_args: Dict[str, TensorArgument], axes):
+def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, globs: Globals,
+                tensor_args: Dict[str, TensorArgument], axes: List[Axis]):
     args = []
     for a in parsed_func.args.args:
         ta = tensor_args.get(a.arg, None)
@@ -398,42 +458,23 @@ def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, globs: Globals,
             args.append(a)
         else:
             args.extend(ta.kernel_args_def())
-    for a in axes.values():
+    for a in axes:
+        args.append(ast.arg(a.size_name()))
+    for a in axes:
         args.append(a.ast_block_size_arg())
 
+    writer = Writer()
+    pid = writer.init('pid', ast.Call(globs.ast_tl('program_id'), [], [ast.keyword('axis', ast.Constant(0))]))
+    for a in axes:
+        a.init_kernel(writer, pid.id)
+
+    for n, ta in tensor_args.items():
+        writer.init(n + '_p', ta.ast_calc_pointer())
     replacer = TensorArgumentReplacer(tensor_args)
-    init_body = (
-        [
-            ast.Assign(
-                [ast.Name('_'.join(a) + '_i', ast.Store())],
-                ast.Call(
-                    globs.ast_tl('program_id'),
-                    [], [ast.keyword('axis', ast.Constant(i))]
-                )
-            )
-            for i, a in enumerate(map(lambda i: i[0], filter(lambda i: not i[1], axes.items())))
-        ] +
-        [
-            ast.Assign(
-                [ast.Name('_'.join(a) + '_i', ast.Store())],
-                ast.Call(
-                    globs.ast_tl('arange'),
-                    [ast.Constant(0), ast.Name('BLOCK_SIZE_' + '_'.join(a).upper(), ast.Load())], []
-                )
-            )
-            for a, r in axes.items()
-            if r
-        ] + [
-            ast.Assign(
-                [ast.Name(n + '_p', ast.Store())],
-                ta.ast_calc_pointer()
-            )
-            for n, ta in tensor_args.items()
-        ])
     body = [replacer.visit(node) for node in parsed_func.body]
     kernel = ast.FunctionDef(parsed_func.name + '_kernel',
                              ast.arguments([], args, None, [], [], None, []),
-                             init_body + body, [globs.ast_triton('jit')])
+                             writer.body + body, [globs.ast_triton('jit')])
     return kernel
 
 
@@ -475,7 +516,7 @@ def distribute_axes(annotations, reduced) -> Dict[Tuple[str, ...], Axis]:
                 item.append(n)
                 n = seq_map[n][1]
             result.append(tuple(item))
-    return {r: Axis(r, r in reduced) for r in result}
+    return result
 
 
 def patch_cache(name, code):
@@ -503,12 +544,11 @@ def tritonize(save_to: Optional[str] = None, DEFAULT_BS=None, **kwargs):
         }
         reduced_axes = ReductionFinder.find_axes(parsed, all_dims)
 
-        axes = distribute_axes(args.annotations, reduced_axes)
-        for a in axes.values():
-            a.block_size = kwargs.get(a.block_size_name(), DEFAULT_BS)
-            a.g = globs
+        axes: List[Axis] = [
+            Axis(a, kwargs.get(Axis.block_size_name_(a), DEFAULT_BS), globs)
+            for a in distribute_axes(args.annotations, reduced_axes)
+        ]
 
-        assert len([1 for r in axes.values() if not r]) <= 3
         tensor_args = {name: TensorArgument(name, tp.dimensions, axes, globs, need_contiguous=tp.need_contiguous)
                        for name, tp in args.annotations.items()
                        if isinstance(tp, NamedTensor)}
@@ -516,6 +556,7 @@ def tritonize(save_to: Optional[str] = None, DEFAULT_BS=None, **kwargs):
         kernel = make_kernel(parsed, args, globs, tensor_args, axes)
         wrapper = make_wrapper(parsed, axes, tensor_args)
         module = ast.Module([kernel, wrapper], [])
+        # setattr(kernel, 'lineno', parsed_func.lineno)
         ast.fix_missing_locations(module)
 
         code = ast.unparse(module)
@@ -523,7 +564,6 @@ def tritonize(save_to: Optional[str] = None, DEFAULT_BS=None, **kwargs):
 
         #print(ast.dump(wrapper, indent=4))
         if save_to is not None:
-            # TODO save
             module_file = save_to
         else:
             module_file = f'<{parsed.name}_kernel>'
