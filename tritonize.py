@@ -39,6 +39,9 @@ class Globals:
         return ast.Attribute(ast.Name(self.triton, ast.Load()), attr, ast.Load())
 
     def cdiv(self, a: ast.expr, b: ast.expr):
+        return ast.Call(self.ast_triton('cdiv'), [a, b], [])
+
+    def tl_cdiv(self, a: ast.expr, b: ast.expr):
         return ast.Call(self.ast_tl('cdiv'), [a, b], [])
 
 
@@ -145,8 +148,14 @@ class Axis:
                 name + '_i',
                 ast.Call(self.g.ast_tl('arange'), [ast.Constant(0), self.ast_block_size()], []))
         else:
-            blocks = writer.init(self.name + '_blocks', self.g.cdiv(self.ast_size(), self.ast_block_size()))
-            self.index = writer.init(name + '_i', ast.BinOp(ast.Name(pid, ast.Load()), ast.Mod(), blocks))
+            blocks = writer.init(self.name + '_blocks', self.g.tl_cdiv(self.ast_size(), self.ast_block_size()))
+            block_index = ast.BinOp(ast.Name(pid, ast.Load()), ast.Mod(), blocks)
+            self.index = writer.init(
+                name + '_i',
+                ast.BinOp(
+                    ast.BinOp(block_index, ast.Mult(), self.ast_block_size()),
+                    ast.Add(),
+                    ast.Call(self.g.ast_tl('arange'), [ast.Constant(0), self.ast_block_size()], [])))
             writer.aug_assign(pid, ast.FloorDiv(), blocks)
         if not self.no_mask:
             self.mask = writer.init(
@@ -231,7 +240,7 @@ class TensorArgument:
         result = [ast.Name(self.name, ast.Load())]
         if not self.need_contiguous:
             for axis, r in self.axis_ranges():
-                result.append(ast_product(*map(self.ast_get_stride, r)))
+                result.append(self.ast_get_stride(r[-1]))
         return result
 
     def kernel_args_def(self):
@@ -318,7 +327,7 @@ def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, Tens
         if with_assert and len(shapes) > 1:
             writer.assert_eq(size, *shapes[1:], msg=f'{size.id} not equal on tensors')
         kernel_args.append(size)
-    grid = writer.init('__grid__', make_grid_lambda(axes))
+    grid = writer.init('_grid', make_grid_lambda(axes))
     writer.call(
         ast.Subscript(
             ast.Name(parsed_func.name + "_kernel", ctx=ast.Load()),
@@ -556,7 +565,6 @@ def tritonize(save_to: Optional[str] = None, DEFAULT_BS=None, **kwargs):
         kernel = make_kernel(parsed, args, globs, tensor_args, axes)
         wrapper = make_wrapper(parsed, axes, tensor_args)
         module = ast.Module([kernel, wrapper], [])
-        # setattr(kernel, 'lineno', parsed_func.lineno)
         ast.fix_missing_locations(module)
 
         code = ast.unparse(module)
@@ -565,6 +573,16 @@ def tritonize(save_to: Optional[str] = None, DEFAULT_BS=None, **kwargs):
         #print(ast.dump(wrapper, indent=4))
         if save_to is not None:
             module_file = save_to
+            with open(save_to, 'w') as file:
+                imports = ast.Module([
+                    ast.Import([ast.alias('torch', globs.torch)]),
+                    ast.Import([ast.alias('triton', globs.triton)]),
+                    ast.Import([ast.alias('triton.language', globs.tl)])
+                ], [])
+                file.write(ast.unparse(imports))
+                file.write('\n\n\n')
+                file.write(code)
+                file.write('\n')
         else:
             module_file = f'<{parsed.name}_kernel>'
             patch_cache(module_file, code)
