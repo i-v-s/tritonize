@@ -252,11 +252,11 @@ class TensorArgument:
         self.value_p = writer.init(self.name + '_p', ast_sum(ast.Name(self.name + '_ptr', ast.Load()), *offsets))
         masks = [a.mask for a in self.axes if a.mask is not None]
         if masks:
-            self.mask = writer.init(f'{self.name}_m', ast_product(*masks)) if len(masks) > 1 else masks[0]
+            self.mask = writer.init(f'{self.name}_m', ast_and(*masks)) if len(masks) > 1 else masks[0]
 
     def ast_pointer(self, fields=None):
         result = self.value_p
-        for field in fields:
+        for field in fields or []:
             if isinstance(field, ast.Slice):
                 assert field.lower is None and field.upper is None, 'Slicing not implemented'
                 continue

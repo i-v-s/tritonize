@@ -1,5 +1,5 @@
 from types import FunctionType
-from typing import List, Dict, Set, Any
+from typing import List, Dict, Set, Any, Optional
 from inspect import getsource
 import ast
 
@@ -7,18 +7,84 @@ from .data import TensorArgument, Writer
 from .utils import ast_and
 
 
+class Renamer(ast.NodeTransformer):
+    def __init__(self, rename_map: Dict[str, str], result: Optional[ast.Name] = None):
+        self.result = result
+        self.rename_map = rename_map
+
+    def visit_Name(self, node: ast.Name) -> Any:
+        value = self.rename_map.get(node.id, None)
+        if value is not None:
+            node.id = value
+            return node
+        else:
+            return self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> Any:
+        return self.generic_visit(node)
+
+    def visit_Return(self, node: ast.Return) -> Any:
+        if self.result is not None:
+            return ast.Assign([self.result], node.value)
+        else:
+            return self.generic_visit(node)
+
+
 class Inliner(ast.NodeTransformer):
     def __init__(self, ns):
         self.ns = ns
+        self.locals = set()
+        self.generated = []
+        self.count = 0
 
-    # def visit_
+    def process_body(self, body: List[ast.stmt]):
+        result = []
+        for stmt in body:
+            item = self.visit(stmt)
+            if self.generated:
+                result.extend(self.generated)
+                self.generated.clear()
+            if item is not None:
+                result.append(item)
+        return result
 
-    def visit_Call(self, node: ast.Call) -> Any:
+    def visit_If(self, node: ast.If) -> Any:
+        node.test = self.visit(node.test)
+        node.body = self.process_body(node.body)
+        if node.orelse:
+            node.orelse = self.process_body(node.orelse)
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
+        for arg in node.args.args:
+            self.locals.add(arg.arg)
+        node.body = self.process_body(node.body)
+        return node
+
+    def visit_Assign(self, node: ast.Assign) -> Any:
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                self.locals.add(target.id)
+        if isinstance(node.value, ast.Call) and len(node.targets) == 1:
+            value = self.visit_Call(node.value, result=node.targets[0])
+            if value is None:
+                return None
+            else:
+                node.value = value
+                return node
+        else:
+            return self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call, result: Optional[ast.Name] = None) -> Any:
         if isinstance(node.func, ast.Name):
             func = self.ns.get(node.func.id, None)
             if isinstance(func, FunctionType):
-                tree = ast.parse(getsource(func)).body[0]
-                print()
+                tree: ast.FunctionDef = ast.parse(getsource(func)).body[0]
+                r_map = {}
+                for fa, ca in zip(tree.args.args, node.args):
+                    r_map[fa.arg] = ca.id
+                ren = Renamer(r_map, result)
+                self.generated.extend(ren.visit(item) for item in tree.body)
         return self.generic_visit(node)
 
 
@@ -76,59 +142,6 @@ def replace_tensor_argument(body: List[ast.stmt], args: Dict[str, TensorArgument
     return [ar.visit(item) for item in body]
 
 
-# TODO: Remove
-class TensorArgumentReplacer(ast.NodeTransformer):
-    def __init__(self, args: Dict[str, TensorArgument]):
-        self.args = args
-
-    def visit_Attribute(self, node: ast.Attribute) -> Any:
-        value = node.value
-        if isinstance(value, ast.Name) and value.id in self.args:
-            arg = self.args[value.id]
-            if isinstance(node.ctx, ast.Load):
-                return TLLoad(arg, node.attr)  # arg.ast_load(node.attr)
-            else:
-                raise TypeError('Unexpected context')
-        else:
-            return self.generic_visit(node)
-
-    def visit_Name(self, node: ast.Name) -> Any:
-        arg = self.args.get(node.id, None)
-        if arg is None:
-            return self.generic_visit(node)
-        elif isinstance(node.ctx, ast.Load):
-            return TLLoad(arg)  # arg.ast_load()
-        else:
-            raise TypeError('Unexpected context')
-
-    def visit_Assign(self, node: ast.Assign) -> Any:
-        targets = node.targets
-        if len(targets) == 1:
-            target = targets[0]
-            if isinstance(target, ast.Name) and target.id in self.args:
-                return ast.Expr(self.args[target.id].ast_store(self.visit(node.value)))
-            elif isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
-                arg = self.args.get(target.value.id, None)
-                if arg is not None:
-                    return ast.Expr(arg.ast_store(self.visit(node.value), field=target.attr))
-        return self.generic_visit(node)
-
-    def visit_AugAssign(self, node: ast.AugAssign) -> Any:
-        target = node.target
-        if isinstance(target, ast.Name):
-            arg = self.args.get(target.id, None)
-            if arg is not None:
-                return ast.Expr(arg.ast_store(ast.BinOp(arg.ast_load(), node.op, self.generic_visit(node.value))))
-        elif isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
-            arg = self.args.get(target.value.id, None)
-            if arg is not None:
-                field = target.attr
-                return ast.Expr(arg.ast_store(
-                    ast.BinOp(arg.ast_load(field=field), node.op, self.generic_visit(node.value)),
-                    field=field))
-        return self.generic_visit(node)
-
-
 class LoadStoreInsert(ast.NodeTransformer):
     def __init__(self, mask=None):
         self.mask = mask
@@ -152,7 +165,19 @@ class LoadStoreInsert(ast.NodeTransformer):
             return ast.Assign(targets, value, node.type_comment)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> Any:
-        raise NotImplementedError('AugAssign: not implemented')
+        target = self.visit(node.target)
+        value = self.visit(node.value)
+        if isinstance(target, TAName):
+            arg = target.arg
+            if arg is not None:
+                return ast.Expr(arg.ast_store(
+                    ast.BinOp(arg.ast_load(), node.op, arg.ast_load(fields=target.fields, mask=self.mask)),
+                    fields=target.fields, mask=self.mask
+                ))
+        else:
+            node.target = target
+            node.value = value
+            return node
 
 
 def replace_if(writer: Writer, body: List[ast.stmt], mask: ast.expr = None, mask_id: str = 'mask'):
@@ -178,7 +203,7 @@ def replace_if(writer: Writer, body: List[ast.stmt], mask: ast.expr = None, mask
                         loc_mask = ast.UnaryOp(ast.Invert(), loc_mask)
                         continue
                     else:
-                        replace_if(writer, e, ast.UnaryOp(ast.Invert(), loc_mask, f'{mask_id}_{index + 1}'))
+                        replace_if(writer, e, ast.UnaryOp(ast.Invert(), loc_mask), f'{mask_id}_{index + 1}')
                         break
                 else:
                     break
