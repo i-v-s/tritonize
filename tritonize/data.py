@@ -15,6 +15,9 @@ class NamedTensor:
         self.dimensions = dimensions
         self.need_contiguous = need_contiguous
 
+    def contiguous(self):
+        return NamedTensor(self.dimensions, need_contiguous=True)
+
 
 class Globals:
     def __init__(self, globs):

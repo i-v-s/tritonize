@@ -1,4 +1,5 @@
 from typing import Dict, List, Tuple, Any, Iterable, Set, Optional, NamedTuple, get_type_hints
+from copy import copy
 
 import ast
 from ast import parse, get_source_segment, unparse
@@ -189,7 +190,12 @@ def patch_cache(name, code):
     linecache.getlines = monkey_patch
 
 
-def tritonize(save_to: Optional[str] = None, DEFAULT_BS=None, **kwargs):
+def tritonize(save_to: Optional[str] = None,
+              anno: Optional[Dict[str, NamedTensor]] = None,
+              DEFAULT_BS: Optional[int] = 128,
+              **kwargs):
+    anno = anno or {}
+
     def decorator(f):
         globs = Globals(f.__globals__)
         print('hints:', get_type_hints(f))
@@ -197,25 +203,29 @@ def tritonize(save_to: Optional[str] = None, DEFAULT_BS=None, **kwargs):
         source = getsource(f)
         parsed = parse(source).body[0]
         parsed = Inliner(globs.globals).visit(parsed)
+        f_anno = copy(args.annotations)
+        f_anno.update(anno)
         all_dims = {
             dim
-            for name, tp in args.annotations.items() if isinstance(tp, NamedTensor)
+            for name, tp in f_anno.items() if isinstance(tp, NamedTensor)
             for dim in tp.dimensions if isinstance(dim, str)
         }
         reduced_axes = ReductionFinder.find_axes(parsed, all_dims)
-
         axes: List[Axis] = [
             Axis(a, kwargs.get(Axis.block_size_name_(a), DEFAULT_BS), globs)
-            for a in distribute_axes(args.annotations, reduced_axes)
+            for a in distribute_axes(f_anno, reduced_axes)
         ]
 
         tensor_args = {name: TensorArgument(name, tp.dimensions, axes, globs, need_contiguous=tp.need_contiguous)
-                       for name, tp in args.annotations.items()
+                       for name, tp in f_anno.items()
                        if isinstance(tp, NamedTensor)}
 
         kernel = make_kernel(parsed, args, globs, tensor_args, axes)
         wrapper = make_wrapper(parsed, axes, tensor_args)
-        module = ast.Module([kernel, wrapper], [])
+        imports = [ast.Import([ast.alias(j, i)])
+                   for i, j in [(globs.torch, 'torch'), (globs.triton, 'triton'), (globs.tl, 'triton.language')]
+                   if i not in globs.globals]
+        module = ast.Module(imports + [kernel, wrapper], [])
         ast.fix_missing_locations(module)
 
         code = ast.unparse(module)
