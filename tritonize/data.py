@@ -98,6 +98,15 @@ class Axis:
     def __str__(self):
         return self.name
 
+    def check_size(self, writer: Writer, size: ast.AST):
+        bs = ast.Constant(self.block_size)
+        if self.no_mask and self.one_block:
+            writer.assert_eq(size, bs)
+        elif self.no_mask:
+            writer.assert_eq(ast.BinOp(size, ast.Mod(), bs), ast.Constant(0))
+        elif self.one_block:
+            writer.assert_(ast.Compare(size, [ast.LtE()], [bs]))
+
     @staticmethod
     def block_size_name_(dims: Tuple[str, ...]) -> str:
         return '_'.join(dims).upper() + '_BS'
@@ -195,7 +204,7 @@ class TensorArgument:
             self.ast_attr('stride'),
             [ast.Constant(i)], [])
 
-    def prepare_args(self, writer: Writer, with_assert=True):
+    def prepare(self, writer: Writer, with_assert=True):
         if not with_assert:
             return
         dim_len = len(self.dims)

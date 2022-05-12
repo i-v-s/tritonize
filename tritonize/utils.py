@@ -10,7 +10,7 @@ def ast_bin_op(a1, *args, op=None):
 
 
 def ast_product(*factors):
-    return ast_bin_op(*factors, op=ast.Mult())
+    return ast_bin_op(*factors, op=ast.Mult()) if factors else ast.Constant(1)
 
 
 def ast_sum(*terms):

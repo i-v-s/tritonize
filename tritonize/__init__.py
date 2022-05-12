@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Any, Iterable, Set, Optional, NamedTuple, get_type_hints
+from typing import Dict, List, Tuple, Any, Iterable, Set, Optional, Union
 from copy import copy
 
 import ast
@@ -39,7 +39,7 @@ def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, Tens
             *[ast.Attribute(ast.Name(a, ast.Load()), "is_cuda", ast.Load()) for a in tensor_args.keys()],
             msg='All tensors must be stored in GPU')
     for ta in tensor_args.values():
-        ta.prepare_args(writer, with_assert)
+        ta.prepare(writer, with_assert)
     kernel_args = []
     for a in parsed_args.args:
         ta = tensor_args.get(a.arg, None)
@@ -51,6 +51,7 @@ def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, Tens
         size = writer.init(axis.size_name(), shapes[0])
         if with_assert and len(shapes) > 1:
             writer.assert_eq(size, *shapes[1:], msg=f'{size.id} not equal on tensors')
+        axis.check_size(writer, size)
         kernel_args.append(size)
     grid = writer.init('_grid', make_grid_lambda(axes))
     writer.call(
@@ -78,11 +79,6 @@ def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, Tens
                               writer.body,
                               [])
     return wrapper
-
-
-#class AttributeReplacer(ast.NodeTransformer):
-#    def __init__(self, args: Dict[str, TensorArgument]):
-#        self.args = args
 
 
 def trace_variables(body: List[Any], args):
@@ -138,7 +134,7 @@ def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, globs: Globals,
     return kernel
 
 
-def distribute_axes(annotations, reduced) -> Dict[Tuple[str, ...], Axis]:
+def distribute_axes(annotations, reduced) -> List[Tuple[str, ...]]:
     dims = [tp.dimensions for name, tp in annotations.items() if isinstance(tp, NamedTensor)]
     seqs = set()
     for d in dims:
@@ -193,12 +189,15 @@ def patch_cache(name, code):
 def tritonize(save_to: Optional[str] = None,
               anno: Optional[Dict[str, NamedTensor]] = None,
               DEFAULT_BS: Optional[int] = 128,
+              one_block: Optional[List[Union[str, Tuple[str, ...]]]] = None,
+              no_mask: Optional[List[Union[str, Tuple[str, ...]]]] = None,
               **kwargs):
     anno = anno or {}
+    one_block = set(d if isinstance(d, tuple) else (d,) for d in one_block or [])
+    no_mask = set(d if isinstance(d, tuple) else (d,) for d in no_mask or [])
 
     def decorator(f):
         globs = Globals(f.__globals__)
-        print('hints:', get_type_hints(f))
         args = getfullargspec(f)
         source = getsource(f)
         parsed = parse(source).body[0]
@@ -212,7 +211,9 @@ def tritonize(save_to: Optional[str] = None,
         }
         reduced_axes = ReductionFinder.find_axes(parsed, all_dims)
         axes: List[Axis] = [
-            Axis(a, kwargs.get(Axis.block_size_name_(a), DEFAULT_BS), globs)
+            Axis(a, kwargs.get(Axis.block_size_name_(a), DEFAULT_BS), globs,
+                 one_block=a in one_block,
+                 no_mask=a in no_mask)
             for a in distribute_axes(f_anno, reduced_axes)
         ]
 
