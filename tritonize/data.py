@@ -1,4 +1,4 @@
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Iterable, Optional
 import ast
 from copy import copy
 
@@ -9,14 +9,48 @@ import triton.language as tl
 from .utils import ast_len, ast_sum, ast_product, ast_and
 
 
+def name(v) -> str:
+    if isinstance(v, str):
+        return v
+    return v.__name__.lower()
+
+
+def fields(v) -> Optional[Iterable[str]]:
+    if isinstance(v, list):
+        return v
+    if hasattr(v, '_fields'):
+        return getattr(v, '_fields')
+    return None
+
+
 class NamedTensor:
     def __init__(self, *dimensions, need_contiguous=False, **kwargs):
         # super(NamedTensor, self).__init__(torch.zeros(1))
         self.dimensions = dimensions
         self.need_contiguous = need_contiguous
+        self.kwargs = kwargs
+
+    def without(self, *names: str) -> 'NamedTensor':
+        dims = set(self.dim_names())
+        assert all(n in dims for n in names)
+        return NamedTensor(*filter(lambda d: name(d) not in names, self.dimensions), need_contiguous=self.need_contiguous)
 
     def contiguous(self):
         return NamedTensor(self.dimensions, need_contiguous=True)
+
+    def dim_names(self) -> Iterable[str]:
+        return map(name, self.dimensions)
+
+    def sizes(self, tensor: torch.Tensor) -> Dict[str, int]:
+        return {name(k): v for k, v in zip(self.dimensions, tensor.shape)}
+
+    def zeros(self, sizes: Dict[str, int], **kwargs):
+        kw = copy(self.kwargs)
+        kw.update(kwargs)
+        return torch.zeros(
+            *(sizes.get(name(d), None) or len(fields(d))
+              for d in self.dimensions
+              ), names=list(self.dim_names()), **kw)
 
 
 class Globals:
@@ -155,7 +189,7 @@ class Axis:
 
 
 class TensorArgument:
-    def __init__(self, name, dims, axes: List[Axis], globs: Globals, need_contiguous=False):
+    def __init__(self, name: str, dims, axes: List[Axis], globs: Globals, need_contiguous=False):
         self.name = name
         self.dims = dims
         self.axes = self.choose_axes(axes)
@@ -163,8 +197,8 @@ class TensorArgument:
         self.field_map = {
             field: (i, j)
             for i, dim in enumerate(dims)
-            if isinstance(dim, list)
-            for j, field in enumerate(dim)
+            if fields(dim) is not None
+            for j, field in enumerate(fields(dim))
         }
         # Flags:
         self.need_contiguous = need_contiguous
@@ -177,7 +211,7 @@ class TensorArgument:
         axes = {a.dims: a for a in axes}
         result = []
         for dim in self.dims:
-            if isinstance(dim, list):
+            if isinstance(dim, list) or hasattr(dim, '_fields'):
                 assert not buf
             else:
                 buf += (dim,)
@@ -272,7 +306,9 @@ class TensorArgument:
             if isinstance(field, ast.Slice):
                 assert field.lower is None and field.upper is None, 'Slicing not implemented'
                 continue
-            i, j = self.field_map[field]
+            indices = self.field_map.get(field, None)
+            assert indices, f'Field {field} not present in type {self.name}'
+            i, j = indices
             if j > 0:
                 result = ast_sum(result, ast.BinOp(
                     ast.Constant(j),
