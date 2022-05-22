@@ -36,7 +36,7 @@ class NamedTensor:
         return NamedTensor(*filter(lambda d: name(d) not in names, self.dimensions), need_contiguous=self.need_contiguous)
 
     def contiguous(self):
-        return NamedTensor(self.dimensions, need_contiguous=True)
+        return NamedTensor(*self.dimensions, need_contiguous=True)
 
     def dim_names(self) -> Iterable[str]:
         return map(name, self.dimensions)
@@ -50,7 +50,9 @@ class NamedTensor:
         return torch.zeros(
             *(sizes.get(name(d), None) or len(fields(d))
               for d in self.dimensions
-              ), names=list(self.dim_names()), **kw)
+              ),
+            # names=list(self.dim_names()),
+            **kw)
 
 
 class Globals:
@@ -290,11 +292,18 @@ class TensorArgument:
 
     def init_kernel(self, writer):
         offsets = []
-        for axis in self.axes:
-            offsets.append(ast_product(
-                ast.Name(f'{axis}_i', ast.Load()),
-                ast.Name(f'{self.name}_{axis}_stride', ast.Load())
-            ))
+        if self.need_contiguous:
+            factors = []
+            for axis in reversed(self.axes):
+                offsets.append(ast_product(*([ast.Name(f'{axis}_i', ast.Load())] + factors)))
+                factors.append(ast.Name(f'{axis}_size', ast.Load()))
+            factors.reverse()
+        else:
+            for axis in self.axes:
+                offsets.append(ast_product(
+                    ast.Name(f'{axis}_i', ast.Load()),
+                    ast.Name(f'{self.name}_{axis}_stride', ast.Load())
+                ))
         self.value_p = writer.init(self.name + '_p', ast_sum(ast.Name(self.name + '_ptr', ast.Load()), *offsets))
         masks = [a.mask for a in self.axes if a.mask is not None]
         if masks:
