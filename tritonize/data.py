@@ -9,9 +9,11 @@ import triton.language as tl
 from .utils import ast_len, ast_sum, ast_product, ast_and
 
 
-def name(v) -> str:
+def name(v) -> Optional[str]:
     if isinstance(v, str):
         return v
+    if isinstance(v, list):
+        return None
     return v.__name__.lower()
 
 
@@ -194,7 +196,7 @@ class TensorArgument:
     def __init__(self, name: str, dims, axes: List[Axis], globs: Globals, need_contiguous=False):
         self.name = name
         self.dims = dims
-        self.axes = self.choose_axes(axes)
+        self.axes, self.full_axes = self.choose_axes(axes)
         self.g = globs
         self.field_map = {
             field: (i, j)
@@ -215,6 +217,7 @@ class TensorArgument:
         for dim in self.dims:
             if isinstance(dim, list) or hasattr(dim, '_fields'):
                 assert not buf
+                result.append(dim)
             else:
                 buf += (dim,)
                 axis = axes.get(buf, None)
@@ -222,7 +225,7 @@ class TensorArgument:
                     result.append(axis)
                     buf = ()
         assert not buf
-        return result
+        return [a for a in result if isinstance(a, Axis)], result
 
     def ast_name(self):
         return ast.Name(self.name, ast.Load())
@@ -276,7 +279,7 @@ class TensorArgument:
             for axis, r in self.axis_ranges():
                 result.append(self.ast_get_stride(r[-1]))
             for i, d in enumerate(self.dims):
-                if isinstance(d, list):
+                if fields(d) is not None:
                     result.append(self.ast_get_stride(i))
         return result
 
@@ -284,19 +287,24 @@ class TensorArgument:
         result = [ast.arg(self.name + '_ptr')]
         if not self.need_contiguous:
             for axis in self.axes:
-                result.append(ast.arg(f'{self.name}_{axis.name}_stride'))
+                result.append(ast.arg(f'{self.name}_{axis}_stride'))
             for i, d in enumerate(self.dims):
-                if isinstance(d, list):
-                    result.append(ast.arg(f'{self.name}_{i}_stride'))
+                if fields(d) is not None:
+                    result.append(ast.arg(f'{self.name}_{name(d) or i}_stride'))
         return result
 
     def init_kernel(self, writer):
+
+        # Calculate pointer:
         offsets = []
         if self.need_contiguous:
             factors = []
-            for axis in reversed(self.axes):
-                offsets.append(ast_product(*([ast.Name(f'{axis}_i', ast.Load())] + factors)))
-                factors.append(ast.Name(f'{axis}_size', ast.Load()))
+            for axis in reversed(self.full_axes):
+                if isinstance(axis, Axis):
+                    offsets.append(ast_product(*([ast.Name(f'{axis}_i', ast.Load())] + factors)))
+                    factors.append(ast.Name(f'{axis}_size', ast.Load()))
+                else:
+                    factors.append(ast.Constant(len(fields(axis))))
             factors.reverse()
         else:
             for axis in self.axes:
@@ -305,6 +313,8 @@ class TensorArgument:
                     ast.Name(f'{self.name}_{axis}_stride', ast.Load())
                 ))
         self.value_p = writer.init(self.name + '_p', ast_sum(ast.Name(self.name + '_ptr', ast.Load()), *offsets))
+
+        # Calculate mask:
         masks = [a.mask for a in self.axes if a.mask is not None]
         if masks:
             self.mask = writer.init(f'{self.name}_m', ast_and(*masks)) if len(masks) > 1 else masks[0]
@@ -319,10 +329,16 @@ class TensorArgument:
             assert indices, f'Field {field} not present in type {self.name}'
             i, j = indices
             if j > 0:
-                result = ast_sum(result, ast.BinOp(
-                    ast.Constant(j),
-                    ast.Mult(),
-                    ast.Name(f'{self.name}_{i}_stride', ast.Load())))
+                result = ast_sum(
+                    result,
+                    ast.Constant(j)
+                    if hasattr(self.dims[i], '_fields') else
+                    ast.BinOp(
+                        ast.Constant(j),
+                        ast.Mult(),
+                        ast.Name(f'{self.name}_{name(self.dims[i]) or i}_stride', ast.Load())
+                    )
+                )
         return result
 
     def ast_store(self, value, fields=None, mask=None):
