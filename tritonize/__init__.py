@@ -8,7 +8,10 @@ import linecache
 
 from .utils import ast_product
 from .data import NamedTensor, Axis, TensorArgument, Writer, Globals
-from .tf import ReductionFinder, Inliner, replace_tensor_argument, replace_if
+from .tf import replace_if
+from .tf import replace_tensor_argument
+from .tf import Inliner
+from .tf import ReductionFinder
 
 
 def make_grid_lambda(axes: Iterable[Axis]):
@@ -209,7 +212,7 @@ def tritonize(save_to: Optional[str] = None,
             for name, tp in f_anno.items() if isinstance(tp, NamedTensor)
             for dim in tp.dimensions if isinstance(dim, str)
         }
-        reduced_axes = ReductionFinder.find_axes(parsed, all_dims)
+        reduced_axes = ReductionFinder(all_dims).find_axes(parsed, all_dims)
         axes: List[Axis] = [
             Axis(a, kwargs.get(Axis.block_size_name_(a), DEFAULT_BS), globs,
                  one_block=a in one_block,
