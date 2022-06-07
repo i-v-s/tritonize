@@ -6,12 +6,10 @@ from ast import parse, get_source_segment, unparse
 from inspect import getclosurevars, getsource, getfullargspec, FullArgSpec
 import linecache
 
-from .utils import ast_product
+from .utils import ast_product, build_seq
 from .data import NamedTensor, Axis, TensorArgument, Writer, Globals
-from .tf import replace_if
-from .tf import replace_tensor_argument
-from .tf import Inliner
-from .tf import ReductionFinder
+from .tf import replace_tensor_argument, Inliner, ReductionFinder, ValueTracer
+from .tf.replace_if import replace_if
 
 
 def make_grid_lambda(axes: Iterable[Axis]):
@@ -84,30 +82,6 @@ def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, Tens
     return wrapper
 
 
-def trace_variables(body: List[Any], args):
-    local = {}
-    args.append(local)
-    for item in body:
-        if isinstance(item, ast.If):
-            ...
-            # tracer = ExprTracer()
-            # item.test = tracer.visit(item.test)
-            # item.body = \
-            trace_variables(item.body, args)
-        elif isinstance(item, ast.Assign):
-            tracer = ExprTracer(args)
-            # item.value = \
-            tracer.visit(item.value)
-        elif isinstance(item, ast.AugAssign):
-            tracer = ExprTracer(args)
-            # item.value =\
-            tracer.visit(item.value)
-        else:
-            raise NotImplementedError('Unknown AST type: ' + str(item))
-    return args.pop()
-    # return result
-
-
 def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, globs: Globals,
                 tensor_args: Dict[str, TensorArgument], axes: List[Axis]):
     args = []
@@ -129,11 +103,12 @@ def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, globs: Globals,
     for n, ta in tensor_args.items():
         ta.init_kernel(writer)
     # replacer = TensorArgumentReplacer(tensor_args)
+    parsed_func = ValueTracer().visit(parsed_func)
     body = replace_tensor_argument(parsed_func.body, tensor_args)  # [replacer.visit(node) for node in parsed_func.body]
-    replace_if(writer, body)
+    body, *_ = replace_if(globs, body)
     kernel = ast.FunctionDef(parsed_func.name + '_kernel',
                              ast.arguments([], args, None, [], [], None, []),
-                             writer.body, [globs.ast_triton('jit')])
+                             writer.body + body, [globs.ast_triton('jit')])
     return kernel
 
 
@@ -152,30 +127,7 @@ def distribute_axes(annotations, reduced) -> List[Tuple[str, ...]]:
             seqs.add(r)
     for r in reduced:
         seqs.add(r)
-    seq_map = {}
-    for s in seqs:
-        l = len(s) - 1
-        for i, w in enumerate(s):
-            sm = seq_map.get(w, None)
-            pre = s[i - 1] if i > 0 else None
-            nex = s[i + 1] if i < l else None
-            if sm is None:
-                seq_map[w] = [pre, nex]
-            else:
-                p, n = sm
-                if p != pre:
-                    sm[0] = None
-                if n != nex:
-                    sm[1] = None
-    result = []
-    for d, (p, n) in seq_map.items():
-        if p is None:
-            item = [d]
-            while n is not None:
-                item.append(n)
-                n = seq_map[n][1]
-            result.append(tuple(item))
-    return result
+    return build_seq(seqs)
 
 
 def patch_cache(name, code):

@@ -14,17 +14,6 @@ class TAName(ast.expr):
     _fields = ()
 
 
-class TLLoad(ast.expr):
-    """ tl.load """
-    def __init__(self, arg: TensorArgument, *fields, other=None):
-        super(TLLoad, self).__init__()
-        self.arg = arg
-        self.fields = list(fields)
-        self.other = other
-
-    _fields = ('other',)
-
-
 def replace_tensor_argument(body: List[ast.stmt], args: Dict[str, TensorArgument]):
     class ArgsReplace(ast.NodeTransformer):
         def visit_Name(self, node: ast.Name) -> Any:

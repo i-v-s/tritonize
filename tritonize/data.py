@@ -77,6 +77,17 @@ class Globals:
     def ast_triton(self, attr):
         return ast.Attribute(ast.Name(self.triton, ast.Load()), attr, ast.Load())
 
+    def ast_where(self, *args):
+        return ast.Call(self.ast_tl('where'), list(args), [])
+
+    def fold_where(self, values: List[Tuple[ast.expr, ast.expr]], otherwise: ast.AST):
+        assert isinstance(values, list) and values
+        (mask, value), *values = reversed(values)
+        result = self.ast_where(mask, value, otherwise)
+        for mask, value in values:
+            result = self.ast_where(mask, value, result)
+        return result
+
     def cdiv(self, a: ast.expr, b: ast.expr):
         return ast.Call(self.ast_triton('cdiv'), [a, b], [])
 
