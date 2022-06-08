@@ -55,3 +55,23 @@ def build_seq(seqs, fn=none):
                 n = seq_map[n][1]
             result.append(tuple(item))
     return result
+
+
+def ast_equals(a: Any, b: Any) -> bool:
+    if not type(a) == type(b):
+        return False
+    if isinstance(a, ast.AST):
+        fields = getattr(a, '_fields')
+        assert fields == getattr(b, '_fields')
+        for f in fields:
+            if not ast_equals(getattr(a, f), getattr(b, f)):
+                return False
+    elif isinstance(a, list):
+        if len(a) != len(b):
+            return False
+        for x, y in zip(a, b):
+            if not ast_equals(x, y):
+                return False
+    else:
+        return a == b
+    return True

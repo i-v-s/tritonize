@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import ast_len, ast_sum, ast_product, ast_and
+from .utils import ast_len, ast_sum, ast_product, ast_and, ast_equals
 
 
 def name(v) -> Optional[str]:
@@ -77,8 +77,11 @@ class Globals:
     def ast_triton(self, attr):
         return ast.Attribute(ast.Name(self.triton, ast.Load()), attr, ast.Load())
 
-    def ast_where(self, *args):
-        return ast.Call(self.ast_tl('where'), list(args), [])
+    def ast_where(self, c, a, b):
+        if ast_equals(a, b):
+            return a
+        else:
+            return ast.Call(self.ast_tl('where'), [c, a, b], [])
 
     def fold_where(self, values: List[Tuple[ast.expr, ast.expr]], otherwise: ast.AST):
         assert isinstance(values, list) and values

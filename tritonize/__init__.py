@@ -109,7 +109,7 @@ def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, globs: Globals,
     body = writer.body + body
     kernel = ast.FunctionDef(parsed_func.name + '_kernel',
                              ast.arguments([], args, None, [], [], None, []),
-                             writer.body + body, [globs.ast_triton('jit')])
+                             body, [globs.ast_triton('jit')])
     return kernel
 
 
