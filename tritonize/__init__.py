@@ -106,6 +106,7 @@ def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, globs: Globals,
     parsed_func = ValueTracer().visit(parsed_func)
     body = replace_tensor_argument(parsed_func.body, tensor_args)  # [replacer.visit(node) for node in parsed_func.body]
     body, *_ = replace_if(globs, body)
+    body = writer.body + body
     kernel = ast.FunctionDef(parsed_func.name + '_kernel',
                              ast.arguments([], args, None, [], [], None, []),
                              writer.body + body, [globs.ast_triton('jit')])

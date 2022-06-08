@@ -103,7 +103,7 @@ def assign_if_many(a, b, c, r):
 
 
 def test_assign_if_many():
-    a, b = 1, 100
+    a, b = (torch.tensor([v], device='cuda') for v in [1, 100])
 
     def wrapper(f, c):
         r = torch.zeros(1, device='cuda')
@@ -117,5 +117,6 @@ def test_assign_if_many():
             c=NamedTensor('x'),
             r=NamedTensor('x')
         ))(assign_if_many)
-    assert wrapper(assign_if_many, 0) == wrapper(fn, 0)
-    assert wrapper(assign_if_many, 0) == wrapper(fn, 0)
+    assert wrapper(assign_if_many, 0) == wrapper(fn, torch.tensor([0], device='cuda'))
+    assert wrapper(assign_if_many, 1) == wrapper(fn, torch.tensor([1], device='cuda'))
+    assert wrapper(assign_if_many, 2) == wrapper(fn, torch.tensor([2], device='cuda'))

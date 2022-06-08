@@ -151,7 +151,6 @@ def body_union(g: Globals, bodies: List[List[ast.AST]], masks: List[ast.expr],
                 assert isinstance(values, ast.expr)
                 value = values
             statement = ast.Assign([ast.Name(target, ast.Store())], value)
-            statement.lineno = 1
         result.append(statement)
     return result
 
@@ -169,18 +168,16 @@ def replace_if(g: Globals, body: List[ast.stmt], mask: ast.expr = None, mask_id:
             for b in branches:
                 assert b.mask_id not in loc_vars
                 result.append(ast.Assign([ast.Name(b.mask_id, ast.Store())], b.test))
-                mask = ast.Name(b.mask_id, ast.Load())
-                setattr(mask, 'is_else', b.is_else)
-                masks.append(mask)
+                masks.append(ast.Name(b.mask_id, ast.Load(), is_else=b.is_else))
             bodies, lvs, mns = zip(*(
                 replace_if(g, b.body, m, b.mask_id, loc_vars)
                 for m, b in zip(masks, branches)
             ))
-            unconditional_vars = unconditional_vars.union(b[0] for b in branches)
+            unconditional_vars = unconditional_vars.union(b.mask_id for b in branches)
             for lv, mn in zip(lvs, mns):
                 unconditional_vars = unconditional_vars.union(mn)
                 assert lv == lvs[0]
-            result.append(body_union(g, list(bodies), masks, unconditional_vars, loc_vars))
+            result.extend(body_union(g, list(bodies), masks, unconditional_vars, loc_vars))
             loc_vars = loc_vars.union(lvs[0])
             index += len(branches)
         else:
