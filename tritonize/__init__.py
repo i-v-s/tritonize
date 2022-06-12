@@ -8,8 +8,7 @@ import linecache
 
 from .utils import ast_product, build_seq
 from .data import NamedTensor, Axis, TensorArgument, Writer, Globals
-from .tf import replace_tensor_argument, Inliner, ReductionFinder, ValueTracer
-from .tf.replace_if import replace_if
+from .tf import Tritonize, Inliner, ReductionFinder, ValueTracer
 
 
 def make_grid_lambda(axes: Iterable[Axis]):
@@ -102,10 +101,7 @@ def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, globs: Globals,
         a.init_kernel(writer, pid.id)
     for n, ta in tensor_args.items():
         ta.init_kernel(writer)
-    # replacer = TensorArgumentReplacer(tensor_args)
-    parsed_func = ValueTracer().visit(parsed_func)
-    body = replace_tensor_argument(parsed_func.body, tensor_args)  # [replacer.visit(node) for node in parsed_func.body]
-    body, *_ = replace_if(globs, body)
+    body = Tritonize(globs, tensor_args, axes).visit(parsed_func).body
     body = writer.body + body
     kernel = ast.FunctionDef(parsed_func.name + '_kernel',
                              ast.arguments([], args, None, [], [], None, []),

@@ -1,5 +1,5 @@
 import ast
-from typing import Any
+from typing import List, Any
 
 
 def ast_bin_op(a1, *args, op=None):
@@ -75,3 +75,25 @@ def ast_equals(a: Any, b: Any) -> bool:
     else:
         return a == b
     return True
+
+
+def expand(tensor: ast.expr, dims: List[bool]) -> ast.expr:
+    """
+    Expand tensor dimensions
+    :param tensor: tensor to expand
+    :param dims: list of dimensions, True for new dimension, False for existing
+    :return:
+    """
+    assert not all(dims), 'No existing dim specified'
+    if not any(dims):
+        return tensor
+    slices = [ast.Constant(None) if e else ast.Slice() for e in dims]
+    if len(slices) == 1:
+        sl = slices[0]
+    else:
+        sl = ast.Tuple(slices, ast.Load())
+    return ast.Subscript(tensor, sl, ast.Load())
+
+
+def expand_one(value: ast.expr, dim: int, total: int) -> ast.expr:
+    return expand(value, [i != dim for i in range(total)])

@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Iterable, Optional
+from typing import Dict, List, Tuple, Iterable, Optional, NamedTuple
 import ast
 from copy import copy
 
@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import ast_len, ast_sum, ast_product, ast_and, ast_equals
+from .utils import ast_len, ast_sum, ast_product, ast_and, ast_equals, expand_one
 
 
 def name(v) -> Optional[str]:
@@ -206,11 +206,22 @@ class Axis:
         return self.g.cdiv(self.ast_size(), self.ast_meta_block_size())
 
 
+class TensorValue(NamedTuple):
+    axes: List[Axis]
+
+    def without_field(self, field: str):  # TODO: Implement
+        return TensorValue(self.axes)
+
+    def without_axis(self, axis: Axis):
+        return TensorValue([a for a in self.axes if a is not axis])
+
+
 class TensorArgument:
-    def __init__(self, name: str, dims, axes: List[Axis], globs: Globals, need_contiguous=False):
+    def __init__(self, name: str, dims, all_axes: List[Axis], globs: Globals, need_contiguous=False):
         self.name = name
         self.dims = dims
-        self.axes, self.full_axes = self.choose_axes(axes)
+        self.axes, self.full_axes = self.choose_axes(all_axes)
+        self.axes_order = [a for a in all_axes if a in self.full_axes]
         self.g = globs
         self.field_map = {
             field: (i, j)
@@ -323,15 +334,18 @@ class TensorArgument:
         else:
             for axis in self.axes:
                 offsets.append(ast_product(
-                    ast.Name(f'{axis}_i', ast.Load()),
+                    expand_one(ast.Name(f'{axis}_i', ast.Load()), self.axes_order.index(axis), len(self.axes_order)),
                     ast.Name(f'{self.name}_{axis}_stride', ast.Load())
                 ))
         self.value_p = writer.init(self.name + '_p', ast_sum(ast.Name(self.name + '_ptr', ast.Load()), *offsets))
 
         # Calculate mask:
-        masks = [a.mask for a in self.axes if a.mask is not None]
+        axes = [a for a in self.axes_order if a.mask is not None and a in self.axes]
+        masks = [expand_one(a.mask, i, len(self.axes)) for i, a in enumerate(axes)]
+
         if masks:
             self.mask = writer.init(f'{self.name}_m', ast_and(*masks)) if len(masks) > 1 else masks[0]
+            setattr(self.mask, 'value_type', TensorValue(axes))
 
     def ast_pointer(self, fields=None):
         result = self.value_p
