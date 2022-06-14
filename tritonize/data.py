@@ -215,6 +215,9 @@ class TensorValue(NamedTuple):
     def without_axis(self, axis: Axis):
         return TensorValue([a for a in self.axes if a is not axis])
 
+    def __str__(self):
+        return '(' + ', '.join(map(str, self.axes)) + ')'
+
 
 class TensorArgument:
     def __init__(self, name: str, dims, all_axes: List[Axis], globs: Globals, need_contiguous=False):

@@ -1,5 +1,6 @@
 import ast
-from typing import List, Any
+from typing import List, Union, Any
+from collections import namedtuple
 
 
 def ast_bin_op(a1, *args, op=None):
@@ -97,3 +98,7 @@ def expand(tensor: ast.expr, dims: List[bool]) -> ast.expr:
 
 def expand_one(value: ast.expr, dim: int, total: int) -> ast.expr:
     return expand(value, [i != dim for i in range(total)])
+
+
+def call_args(node: ast.Call, args: Union[str, List[str]]):
+    return namedtuple('t', args)(*node.args, **{kw.arg: kw.value for kw in node.keywords})

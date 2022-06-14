@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple, List, Generator, Optional, Iterable, Union, Tuple, Set, Dict
 
 from tritonize import Globals, TensorArgument
-from tritonize.utils import ast_and, expand
+from tritonize.utils import ast_and, expand, call_args
 from tritonize.data import Axis, TensorValue
 
 
@@ -91,6 +91,7 @@ class Tritonize(ast.NodeTransformer):
     type_attr = 'value_type'
     var_attr = 'variable'
     fields_attr = 'fields'
+    glob_attr = 'glob'
 
     def __init__(self, g: Globals, tensor_args: Dict[str, TensorArgument], axes: List[Axis]):
         super(Tritonize, self).__init__()
@@ -115,6 +116,9 @@ class Tritonize(ast.NodeTransformer):
         if (val := self.local_vars.get(node.id, None)) is not None:
             setattr(node, self.type_attr, val)
             return node
+        if node.id == self.g.tl:
+            setattr(node, self.glob_attr, 'tl')
+            return node
         return self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> Any:
@@ -129,6 +133,8 @@ class Tritonize(ast.NodeTransformer):
             return result
         elif hasattr(item, self.type_attr):
             setattr(node, self.type_attr, getattr(item, self.type_attr).without_field(node.attr))
+        elif hasattr(item, self.glob_attr):
+            setattr(node, self.glob_attr, f'{getattr(item, self.glob_attr)}.{node.attr}')
         node.value = item
         return node
 
@@ -140,6 +146,25 @@ class Tritonize(ast.NodeTransformer):
                 return value
             raise NotImplementedError()
         return ast.Subscript(value, sl, node.ctx)
+
+    def visit_Call(self, node: ast.Call) -> Any:
+        node = self.generic_visit(node)
+        func = node.func
+        glob = getattr(func, self.glob_attr, None)
+        if isinstance(func, ast.Attribute) and glob in ['tl.max', 'tl.min', 'tl.sum']:
+            arg, axis = call_args(node, 'input axis')
+            if (vt := getattr(arg, self.type_attr, False)) and isinstance(axis, ast.Constant):
+                axis = axis.value
+                if isinstance(axis, str):
+                    axes = list(map(str, vt.axes))
+                    assert axis in axes, f'Unable to reduce by axis {axis} in {glob}'
+                    axis = axes.index(axis)
+                    node.args = [arg, ast.Constant(axis)]
+                    node.keywords.clear()
+                assert isinstance(axis, int) and 0 <= axis < len(vt.axes)
+                vt.axes.pop(axis)
+                setattr(node, self.type_attr, vt)
+        return node
 
     def broadcast(self, left: ast.expr, right: ast.expr) -> Tuple[ast.expr, ast.expr, Optional[TensorValue]]:
         lt, rt = (getattr(a, self.type_attr) if hasattr(a, self.type_attr) else None for a in [left, right])
@@ -184,7 +209,10 @@ class Tritonize(ast.NodeTransformer):
         if len(node.targets) == 1 and hasattr(node.value, self.type_attr):
             if hasattr(target, self.var_attr):
                 var: TensorArgument = getattr(target, self.var_attr)
-                assert getattr(target, self.type_attr) == getattr(node.value, self.type_attr), 'Store broadcast not implemented'
+                target_type, value_type = getattr(target, self.type_attr), getattr(node.value, self.type_attr)
+                if target_type != value_type:
+                    v = f'{ast.unparse(node.value)} {value_type}'
+                    raise AssertionError(f'Unable to assign {v} to {var.name} {target_type}')
                 return ast.Expr(var.ast_store(node.value, getattr(target, self.fields_attr), self.mask))
             elif hasattr(node.value, self.type_attr) and isinstance(target, ast.Name):
                 setattr(node, 'new_vars', {target.id: getattr(node.value, self.type_attr)})
