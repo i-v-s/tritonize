@@ -384,11 +384,10 @@ class TensorArgument:
         )
 
     def ast_load(self, fields=None, mask=None):
-        kwargs = {}
+        kwargs = {'other': ast.Constant(0)}
         masks = [m for m in [self.mask, mask] if m is not None]
         if masks:
             kwargs['mask'] = ast_and(*masks)
-            # kwargs.append(ast.keyword('other', ast.Name('other', ast.Load())))
         return ast.Call(
             self.g.ast_tl('load'),
             [self.ast_pointer(fields)],
