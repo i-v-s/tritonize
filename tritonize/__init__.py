@@ -158,7 +158,8 @@ def tritonize(save_to: Optional[str] = None,
         parsed = Inliner(ctx).visit(parsed)
         if print_inlined:
             ast.fix_missing_locations(parsed)
-            print('\n' + ast.unparse(parsed))
+            print('\n\n### Inlined:')
+            print(ast.unparse(parsed))
         f_anno = copy(args.annotations)
         f_anno.update({k: v for k, v in anno.items() if k in args.args})
         all_dims = {
@@ -188,6 +189,7 @@ def tritonize(save_to: Optional[str] = None,
         code = ast.unparse(module)
 
         if print_result:
+            print('\n### Result:')
             print(code)
 
         if save_to is not None:

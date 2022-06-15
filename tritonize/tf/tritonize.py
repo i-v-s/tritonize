@@ -25,9 +25,26 @@ class Node:
 
 
 def body_union(g: Context, bodies: List[List[ast.AST]], masks: List[ast.expr],
-               unconditional_vars: Set[str], present_vars: Set[str]) -> List[ast.AST]:
-    seqs = [[item.targets[0].id for item in body if isinstance(item, ast.Assign)] for body in bodies]
-    assert all(v == 1 for seq in seqs for v in Counter(seq).values())
+               unconditional_vars: Set[str], present_vars: Set[str]) -> List[ast.stmt]:
+
+    # Prepare bodies, rejecting poorly initialized variables from merging
+    ctrs = [
+        Counter(t.id for st in b if isinstance(st, ast.Assign) for t in st.targets if isinstance(t, ast.Name))
+        for b in bodies
+    ]
+    last_else = masks[-1].is_else
+    good_vars = set(k for c in ctrs for k in c.keys() if k not in unconditional_vars)
+    for var in list(good_vars):
+        sparse = sum(1 for c in ctrs if var in c) < len(bodies)
+        present = var in present_vars
+        have_else = last_else and var in ctrs[-1]
+        if not present and (sparse or (not sparse and not have_else)):
+            good_vars.remove(var)
+
+    for i, var in ((i, v) for i, c in enumerate(ctrs) for v in good_vars if c[v] > 1):
+        raise NotImplementedError('Need renaming')
+
+    # Build DAG from bodies, merging assigns with same target
     nodes = []
     var_map: Dict[str, Node] = {}
     for mask, body in zip(masks, bodies):
@@ -37,7 +54,7 @@ def body_union(g: Context, bodies: List[List[ast.AST]], masks: List[ast.expr],
             if isinstance(item, ast.Assign):
                 assert len(item.targets) == 1 and isinstance(item.targets[0], ast.Name)
                 target = item.targets[0].id
-                if target in unconditional_vars:
+                if target not in good_vars:
                     node = Node(target, item.value, [])
                 elif (node := var_map.get(target)) is None:
                     node = Node(target, [(mask, item.value)], [])
@@ -51,6 +68,8 @@ def body_union(g: Context, bodies: List[List[ast.AST]], masks: List[ast.expr],
             if last is not None:
                 last.next.append(node)
             last = node
+
+    # Try to extrude sequence from DAG
     sequence = []
     while nodes:
         for node in nodes:
@@ -62,6 +81,8 @@ def body_union(g: Context, bodies: List[List[ast.AST]], masks: List[ast.expr],
         nodes = [node for node in nodes if not node.first]
         for node in nodes:
             node.first = True
+
+    # Try to combine multiple values with tl.where()
     result = []
     for node in sequence:
         node.next.clear()
@@ -72,13 +93,19 @@ def body_union(g: Context, bodies: List[List[ast.AST]], masks: List[ast.expr],
             statement = values
         else:
             if isinstance(values, list):
-                last_mask, last_value = values[-1]
-                if last_mask.is_else:
-                    value = g.fold_where(values[:-1], last_value)
-                elif target in present_vars:
-                    value = g.fold_where(values, ast.Name(target, ast.Load()))
+                if len(bodies) > len(values):
+                    if target in present_vars:
+                        value = g.fold_where(values, ast.Name(target, ast.Load()))
+                    else:
+                        raise ValueError(f'Unable to deduce value for {target}')
                 else:
-                    raise ValueError(f'Unable to deduce value for {target}')
+                    last_mask, last_value = values[-1]
+                    if last_mask.is_else:
+                        value = g.fold_where(values[:-1], last_value)
+                    elif target in present_vars:
+                        value = g.fold_where(values, ast.Name(target, ast.Load()))
+                    else:
+                        raise ValueError(f'Unable to deduce value for {target}')
             else:
                 assert isinstance(values, ast.expr)
                 value = values
@@ -162,7 +189,7 @@ class Tritonize(ast.NodeTransformer):
                     axes = list(map(str, vt.axes))
                     assert axis in axes, f'Unable to reduce by axis {axis} in {glob}'
                     axis = axes.index(axis)
-                    if other is not None:
+                    if other is not None and self.mask is not None:
                         arg = self.g.ast_where(self.mask, arg, other)
                     node.args = [arg, ast.Constant(axis)]
                     node.keywords.clear()
@@ -214,6 +241,14 @@ class Tritonize(ast.NodeTransformer):
         node.values = values
         return node
 
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> Any:
+        node.operand = self.visit(node.operand)
+        if isinstance(node.op, ast.Not):
+            node.op = ast.Invert()
+        if tv := getattr(node.operand, self.type_attr, False):
+            setattr(node, self.type_attr, tv)
+        return node
+
     def add_unconditional(self, names: Iterable[str]) -> None:
         exists = self.unconditional_vars.intersection(names)
         assert not exists, 'Try to add exists unconditional variable(s): ' + ', '.join(exists)
@@ -239,14 +274,20 @@ class Tritonize(ast.NodeTransformer):
             elif hasattr(node.value, self.type_attr) and isinstance(target, ast.Name):
                 setattr(node, 'new_vars', {target.id: getattr(node.value, self.type_attr)})
         else:
-            assert all(hasattr(t, 'ctx') and isinstance(t.ctx, ast.Store) for t in node.targets)
-        return node
+            assert all(hasattr(t, 'ctx') and isinstance(t.ctx, ast.Store) for t in node.targets),\
+                f'Unable to assign: {ast.unparse(node)}'
+
+        if len(node.targets) == 1 and isinstance(target, ast.Name)\
+                and isinstance(node.value, ast.Name) and target.id == node.value.id:
+            return None
+        else:
+            return node
 
     def parse_if(self, node: ast.If, index: int) -> Generator[MaskedBody, None, None]:
         loc_mask = self.mask
         mask_id = 'mask' if loc_mask is None else loc_mask.id
         while True:
-            loc_mask_id = f'{mask_id}_{index}'
+            loc_mask_id = self.g.new_name(f'{mask_id}_{index}')
             node_test = self.visit(node.test)
             yield MaskedBody(
                 loc_mask_id,
@@ -306,7 +347,8 @@ class Tritonize(ast.NodeTransformer):
                 node = self.visit(node)
                 if hasattr(node, 'new_vars'):
                     loc_vars.update(getattr(node, 'new_vars'))
-                result.append(node)
+                if node is not None:
+                    result.append(node)
         return result, loc_vars
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
