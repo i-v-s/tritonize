@@ -226,8 +226,13 @@ class Tritonize(ast.NodeTransformer):
                 var: TensorArgument = getattr(target, self.var_attr)
                 target_type, value_type = getattr(target, self.type_attr), getattr(node.value, self.type_attr)
                 if target_type != value_type:
-                    v = f'{ast.unparse(node.value)} {value_type}'
-                    raise AssertionError(f'Unable to assign {v} to {var.name} {target_type}')
+                    ta, va = (list(map(str, t.axes)) for t in [target_type, value_type])
+                    if not all(a in ta for a in va):
+                        v = f'{ast.unparse(node.value)} {value_type}'
+                        raise AssertionError(f'Unable to assign {v} to {var.name} {target_type}')
+                    dims = [va.index(a) if a in va else None for a in ta]
+                    assert (d := list(filter(lambda t: isinstance(t, int), dims))) == sorted(d)
+                    node.value = expand(node.value, [t is None for t in dims])
                 return ast.Expr(var.ast_store(node.value, getattr(target, self.fields_attr), self.mask))
             elif hasattr(node.value, self.type_attr) and isinstance(target, ast.Name):
                 setattr(node, 'new_vars', {target.id: getattr(node.value, self.type_attr)})

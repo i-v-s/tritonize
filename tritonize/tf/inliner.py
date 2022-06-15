@@ -80,11 +80,9 @@ class Inliner(ast.NodeTransformer):
                         nn = self.ctx.new_name(fa.arg)
                         r_map[fa.arg] = nn
                         self.generated.append(ast.Assign([ast.Name(nn, ast.Store())], ca))
-                if result is None:
-                    result = ast.Name(self.ctx.new_name(f'{node.func.id}_result'), ast.Store())
-                else:
-                    assert isinstance(result, ast.Name) and isinstance(result.ctx, ast.Store)
-                ren = Renamer(r_map, self.ctx, result, auto_add=True)
+                out = result or ast.Name(self.ctx.new_name(f'{node.func.id}_result'), ast.Store())
+                assert isinstance(out, ast.Name) and isinstance(out.ctx, ast.Store)
+                ren = Renamer(r_map, self.ctx, out, auto_add=True)
                 self.generated.extend(ren.visit(tree).body)
-                return ast.Name(result.id, ast.Load())
+                return None if result else ast.Name(out.id, ast.Load())
         return self.generic_visit(node)
