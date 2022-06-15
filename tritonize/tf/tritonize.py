@@ -155,13 +155,15 @@ class Tritonize(ast.NodeTransformer):
         func = node.func
         glob = getattr(func, self.glob_attr, None)
         if isinstance(func, ast.Attribute) and glob in ['tl.max', 'tl.min', 'tl.sum']:
-            arg, axis = call_args(node, 'input axis')
+            arg, axis, other = call_args(node, 'input axis other', (None, None))
             if (vt := getattr(arg, self.type_attr, False)) and isinstance(axis, ast.Constant):
                 axis = axis.value
                 if isinstance(axis, str):
                     axes = list(map(str, vt.axes))
                     assert axis in axes, f'Unable to reduce by axis {axis} in {glob}'
                     axis = axes.index(axis)
+                    if other is not None:
+                        arg = self.g.ast_where(self.mask, arg, other)
                     node.args = [arg, ast.Constant(axis)]
                     node.keywords.clear()
                 assert isinstance(axis, int) and 0 <= axis < len(vt.axes)

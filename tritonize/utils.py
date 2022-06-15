@@ -1,5 +1,5 @@
 import ast
-from typing import List, Set, Union, Any
+from typing import List, Set, Iterable, Union, Optional, Any
 from collections import namedtuple
 
 
@@ -100,8 +100,8 @@ def expand_one(value: ast.expr, dim: int, total: int) -> ast.expr:
     return expand(value, [i != dim for i in range(total)])
 
 
-def call_args(node: ast.Call, args: Union[str, List[str]]):
-    return namedtuple('t', args)(*node.args, **{kw.arg: kw.value for kw in node.keywords})
+def call_args(node: ast.Call, args: Union[str, List[str]], defaults: Optional[Iterable[Any]] = None):
+    return namedtuple('t', args, defaults=defaults)(*node.args, **{kw.arg: kw.value for kw in node.keywords})
 
 
 class VarScan(ast.NodeVisitor):
