@@ -1,4 +1,6 @@
-from typing import Dict, List, Tuple, Iterable, Optional, NamedTuple
+from typing import Dict, List, Tuple, Set, Iterable, Optional, NamedTuple
+from itertools import count
+
 import ast
 from copy import copy
 
@@ -57,9 +59,10 @@ class NamedTensor:
             **kw)
 
 
-class Globals:
-    def __init__(self, globs):
-        self.globals = copy(globs)
+class Context:
+    def __init__(self, glob, local: Set[str]):
+        self.locals = local
+        self.globals = copy(glob)
         self.tl = 'tl'
         self.triton = 'triton'
         self.torch = 'torch'
@@ -70,6 +73,16 @@ class Globals:
                 self.tl = k
             if v is torch:
                 self.torch = k
+
+    def new_name(self, base: str):
+        if base in self.locals:
+            for i in count(1):
+                nn = f'{base}_{i}'
+                if nn not in self.locals:
+                    base = nn
+                    break
+        self.locals.add(base)
+        return base
 
     def ast_tl(self, attr):
         return ast.Attribute(ast.Name(self.tl, ast.Load()), attr, ast.Load())
@@ -135,7 +148,7 @@ class Writer:
 
 
 class Axis:
-    def __init__(self, dims: Tuple[str, ...], block_size: int, globs: Globals, *, one_block=False, no_mask=False):
+    def __init__(self, dims: Tuple[str, ...], block_size: int, globs: Context, *, one_block=False, no_mask=False):
         self.dims = dims
         self.name = '_'.join(dims)
         self.block_size = block_size
@@ -220,7 +233,7 @@ class TensorValue(NamedTuple):
 
 
 class TensorArgument:
-    def __init__(self, name: str, dims, all_axes: List[Axis], globs: Globals, need_contiguous=False):
+    def __init__(self, name: str, dims, all_axes: List[Axis], globs: Context, need_contiguous=False):
         self.name = name
         self.dims = dims
         self.axes, self.full_axes = self.choose_axes(all_axes)
@@ -384,7 +397,7 @@ class TensorArgument:
         )
 
     def ast_load(self, fields=None, mask=None):
-        kwargs = {'other': ast.Constant(0)}
+        kwargs = {}
         masks = [m for m in [self.mask, mask] if m is not None]
         if masks:
             kwargs['mask'] = ast_and(*masks)

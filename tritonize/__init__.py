@@ -6,9 +6,9 @@ from ast import parse, get_source_segment, unparse
 from inspect import getclosurevars, getsource, getfullargspec, FullArgSpec
 import linecache
 
-from .utils import ast_product, build_seq
-from .data import NamedTensor, Axis, TensorArgument, Writer, Globals
-from .tf import Tritonize, Inliner, ReductionFinder, ValueTracer
+from .utils import ast_product, build_seq, scan_vars
+from .data import NamedTensor, Axis, TensorArgument, Writer, Context
+from .tf import Tritonize, Inliner, ReductionFinder
 
 
 def make_grid_lambda(axes: Iterable[Axis]):
@@ -81,7 +81,7 @@ def make_wrapper(parsed_func: ast.FunctionDef, axes, tensor_args: Dict[str, Tens
     return wrapper
 
 
-def make_kernel(parsed_func: ast.FunctionDef, args: FullArgSpec, globs: Globals,
+def make_kernel(parsed_func: ast.FunctionDef, globs: Context,
                 tensor_args: Dict[str, TensorArgument], axes: List[Axis]):
     args = []
     for a in parsed_func.args.args:
@@ -143,19 +143,24 @@ def tritonize(save_to: Optional[str] = None,
               DEFAULT_BS: Optional[int] = 128,
               one_block: Optional[List[Union[str, Tuple[str, ...]]]] = None,
               no_mask: Optional[List[Union[str, Tuple[str, ...]]]] = None,
+              print_inlined: bool = False, print_result: bool = False,
               **kwargs):
     anno = anno or {}
     one_block = set(d if isinstance(d, tuple) else (d,) for d in one_block or [])
     no_mask = set(d if isinstance(d, tuple) else (d,) for d in no_mask or [])
 
     def decorator(f):
-        globs = Globals(f.__globals__)
         args = getfullargspec(f)
         source = getsource(f)
         parsed = parse(source).body[0]
-        parsed = Inliner(globs.globals).visit(parsed)
+        assert isinstance(parsed, ast.FunctionDef)
+        ctx = Context(f.__globals__, scan_vars(parsed))
+        parsed = Inliner(ctx).visit(parsed)
+        if print_inlined:
+            ast.fix_missing_locations(parsed)
+            print('\n' + ast.unparse(parsed))
         f_anno = copy(args.annotations)
-        f_anno.update(anno)
+        f_anno.update({k: v for k, v in anno.items() if k in args.args})
         all_dims = {
             dim
             for name, tp in f_anno.items() if isinstance(tp, NamedTensor)
@@ -163,35 +168,35 @@ def tritonize(save_to: Optional[str] = None,
         }
         reduced_axes = ReductionFinder(all_dims).find_axes(parsed, all_dims)
         axes: List[Axis] = [
-            Axis(a, kwargs.get(Axis.block_size_name_(a), DEFAULT_BS), globs,
+            Axis(a, kwargs.get(Axis.block_size_name_(a), DEFAULT_BS), ctx,
                  one_block=a in one_block,
                  no_mask=a in no_mask)
             for a in distribute_axes(f_anno, reduced_axes)
         ]
 
-        tensor_args = {name: TensorArgument(name, tp.dimensions, axes, globs, need_contiguous=tp.need_contiguous)
+        tensor_args = {name: TensorArgument(name, tp.dimensions, axes, ctx, need_contiguous=tp.need_contiguous)
                        for name, tp in f_anno.items()
                        if isinstance(tp, NamedTensor)}
 
-        kernel = make_kernel(parsed, args, globs, tensor_args, axes)
+        kernel = make_kernel(parsed, ctx, tensor_args, axes)
         wrapper = make_wrapper(parsed, axes, tensor_args)
         imports = [ast.Import([ast.alias(j, i)])
-                   for i, j in [(globs.torch, 'torch'), (globs.triton, 'triton'), (globs.tl, 'triton.language')]
-                   if i not in globs.globals]
+                   for i, j in [(ctx.torch, 'torch'), (ctx.triton, 'triton'), (ctx.tl, 'triton.language')]
+                   if i not in ctx.globals]
         module = ast.Module(imports + [kernel, wrapper], [])
         ast.fix_missing_locations(module)
-
         code = ast.unparse(module)
-        print(code)
 
-        #print(ast.dump(wrapper, indent=4))
+        if print_result:
+            print(code)
+
         if save_to is not None:
             module_file = save_to
             with open(save_to, 'w') as file:
                 imports = ast.Module([
-                    ast.Import([ast.alias('torch', globs.torch)]),
-                    ast.Import([ast.alias('triton', globs.triton)]),
-                    ast.Import([ast.alias('triton.language', globs.tl)])
+                    ast.Import([ast.alias('torch', ctx.torch)]),
+                    ast.Import([ast.alias('triton', ctx.triton)]),
+                    ast.Import([ast.alias('triton.language', ctx.tl)])
                 ], [])
                 file.write(ast.unparse(imports))
                 file.write('\n\n\n')
@@ -201,6 +206,6 @@ def tritonize(save_to: Optional[str] = None,
             module_file = f'<{parsed.name}_kernel>'
             patch_cache(module_file, code)
         compiled = compile(module, module_file, 'exec')
-        exec(compiled, globs.globals)
-        return globs.globals[parsed.name]
+        exec(compiled, ctx.globals)
+        return ctx.globals[parsed.name]
     return decorator

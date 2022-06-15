@@ -4,7 +4,7 @@ from copy import copy
 from dataclasses import dataclass
 from typing import Any, NamedTuple, List, Generator, Optional, Iterable, Union, Tuple, Set, Dict
 
-from tritonize import Globals, TensorArgument
+from tritonize import Context, TensorArgument
 from tritonize.utils import ast_and, expand, call_args
 from tritonize.data import Axis, TensorValue
 
@@ -24,7 +24,7 @@ class Node:
     first: bool = True
 
 
-def body_union(g: Globals, bodies: List[List[ast.AST]], masks: List[ast.expr],
+def body_union(g: Context, bodies: List[List[ast.AST]], masks: List[ast.expr],
                unconditional_vars: Set[str], present_vars: Set[str]) -> List[ast.AST]:
     seqs = [[item.targets[0].id for item in body if isinstance(item, ast.Assign)] for body in bodies]
     assert all(v == 1 for seq in seqs for v in Counter(seq).values())
@@ -93,7 +93,7 @@ class Tritonize(ast.NodeTransformer):
     fields_attr = 'fields'
     glob_attr = 'glob'
 
-    def __init__(self, g: Globals, tensor_args: Dict[str, TensorArgument], axes: List[Axis]):
+    def __init__(self, g: Context, tensor_args: Dict[str, TensorArgument], axes: List[Axis]):
         super(Tritonize, self).__init__()
         self.g = g
         self.args = tensor_args
@@ -118,6 +118,9 @@ class Tritonize(ast.NodeTransformer):
             return node
         if node.id == self.g.tl:
             setattr(node, self.glob_attr, 'tl')
+            return node
+        if node.id == 'float':
+            setattr(node, self.glob_attr, 'float')
             return node
         return self.generic_visit(node)
 
@@ -195,6 +198,18 @@ class Tritonize(ast.NodeTransformer):
         node.left, node.comparators = left, comps
         if tv is not None:
             setattr(node, self.type_attr, tv)
+        return node
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> Any:  # TODO: Test
+        values = list(map(self.visit, node.values))
+        if isinstance(node.op, ast.Or) and len(values) == 2:
+            l, r = values
+            if tv := getattr(l, self.type_attr, False):
+                if hasattr(l, self.var_attr):
+                    assert isinstance(l, ast.Call) and all(kw.arg != 'other' for kw in l.keywords)
+                    l.keywords.append(ast.keyword('other', r))
+                    return l
+        node.values = values
         return node
 
     def add_unconditional(self, names: Iterable[str]) -> None:
