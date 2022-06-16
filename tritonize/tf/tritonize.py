@@ -7,6 +7,7 @@ from typing import Any, NamedTuple, List, Generator, Optional, Iterable, Union, 
 from tritonize import Context, TensorArgument
 from tritonize.utils import ast_and, expand, call_args
 from tritonize.data import Axis, TensorValue
+from tritonize.tf import Renamer
 
 
 class MaskedBody(NamedTuple):
@@ -24,7 +25,7 @@ class Node:
     first: bool = True
 
 
-def body_union(g: Context, bodies: List[List[ast.AST]], masks: List[ast.expr],
+def body_union(g: Context, bodies: List[List[ast.stmt]], masks: List[ast.expr],
                unconditional_vars: Set[str], present_vars: Set[str]) -> List[ast.stmt]:
 
     # Prepare bodies, rejecting poorly initialized variables from merging
@@ -34,14 +35,19 @@ def body_union(g: Context, bodies: List[List[ast.AST]], masks: List[ast.expr],
     ]
     last_else = masks[-1].is_else
     good_vars = set(k for c in ctrs for k in c.keys() if k not in unconditional_vars)
+    r_map = [{} for _ in bodies]
     for var in list(good_vars):
-        ct = sum(1 for c in ctrs if var in c)
-        sparse = ct < len(bodies)
+        ct = [i for i, c in enumerate(ctrs) if var in c]
+        sparse = len(ct) < len(bodies)
         present = var in present_vars
         have_else = last_else and var in ctrs[-1]
         if not present and (sparse or (not sparse and not have_else)):
             good_vars.remove(var)
-            assert ct == 1, 'Need renaming'
+            for i in ct[1:]:
+                r_map[i][var] = g.new_name(var)
+    for i, rm in enumerate(r_map):
+        if rm:
+            bodies[i] = Renamer(rm, g).visit_body(bodies[i])
 
     for i, var in ((i, v) for i, c in enumerate(ctrs) for v in good_vars if c[v] > 1):
         raise NotImplementedError('Need renaming')

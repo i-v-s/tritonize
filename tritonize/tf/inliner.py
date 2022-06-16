@@ -26,6 +26,9 @@ class Renamer(ast.NodeTransformer):
         else:
             return self.generic_visit(node)
 
+    def visit_body(self, body: List[ast.stmt]):
+        return list(map(self.visit, body))
+
 
 class Inliner(ast.NodeTransformer):
     def __init__(self, ctx: Context):
