@@ -35,11 +35,13 @@ def body_union(g: Context, bodies: List[List[ast.AST]], masks: List[ast.expr],
     last_else = masks[-1].is_else
     good_vars = set(k for c in ctrs for k in c.keys() if k not in unconditional_vars)
     for var in list(good_vars):
-        sparse = sum(1 for c in ctrs if var in c) < len(bodies)
+        ct = sum(1 for c in ctrs if var in c)
+        sparse = ct < len(bodies)
         present = var in present_vars
         have_else = last_else and var in ctrs[-1]
         if not present and (sparse or (not sparse and not have_else)):
             good_vars.remove(var)
+            assert ct == 1, 'Need renaming'
 
     for i, var in ((i, v) for i, c in enumerate(ctrs) for v in good_vars if c[v] > 1):
         raise NotImplementedError('Need renaming')
@@ -56,6 +58,7 @@ def body_union(g: Context, bodies: List[List[ast.AST]], masks: List[ast.expr],
                 target = item.targets[0].id
                 if target not in good_vars:
                     node = Node(target, item.value, [])
+                    nodes.append(node)
                 elif (node := var_map.get(target)) is None:
                     node = Node(target, [(mask, item.value)], [])
                     var_map[target] = node
@@ -331,7 +334,7 @@ class Tritonize(ast.NodeTransformer):
                     if hasattr(b.test, self.type_attr):
                         setattr(m, self.type_attr, getattr(b.test, self.type_attr))
                     masks.append(m)
-                bodies, lvs = zip(*(
+                bodies, lvs = zip(*(  # TODO: Take new vars from body_union
                     self.replace_if(b.body, m, loc_vars)
                     for m, b in zip(masks, branches)
                 ))

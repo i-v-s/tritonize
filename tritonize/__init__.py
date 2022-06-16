@@ -209,5 +209,7 @@ def tritonize(save_to: Optional[str] = None,
             patch_cache(module_file, code)
         compiled = compile(module, module_file, 'exec')
         exec(compiled, ctx.globals)
-        return ctx.globals[parsed.name]
+        result = ctx.globals[parsed.name]
+        setattr(result, 'original', f)
+        return result
     return decorator

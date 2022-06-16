@@ -120,3 +120,38 @@ def test_assign_if_many():
     assert wrapper(assign_if_many, 0) == wrapper(fn, torch.tensor([0], device='cuda'))
     assert wrapper(assign_if_many, 1) == wrapper(fn, torch.tensor([1], device='cuda'))
     assert wrapper(assign_if_many, 2) == wrapper(fn, torch.tensor([2], device='cuda'))
+
+
+def assign_with_temp(a, b):
+    if a > 0:
+        t = a
+        r = t + a
+    else:
+        r = -a
+    b[:] = r
+
+
+def assign_with_temp_2(a, b):
+    if a > 5:
+        t = a
+        r = t + a
+    elif a > 2:
+        t = 2 * a
+        r = a * t
+    else:
+        r = -a
+    b[:] = r
+
+
+@mark.parametrize('size', [100, 200])
+@mark.parametrize('fn', [assign_with_temp, assign_with_temp_2])
+def test_assign_with_temp(fn, size):
+    a = torch.arange(size, device='cuda') - 20
+    b = torch.zeros(size, device='cuda')
+    tfn = tritonize(anno=dict(a=NamedTensor('x'), b=NamedTensor('x')), DEFAULT_BS=128)(fn)
+    tfn(a, b)
+    t = torch.zeros(size)
+    for i in range(size):
+        fn(a[i].item(), t[i:i + 1])
+    assert (b.cpu() == t).all()
+
