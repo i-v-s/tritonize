@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple, List, Generator, Optional, Iterable, Union, Tuple, Set, Dict
 
 from tritonize import Context, TensorArgument
-from tritonize.utils import ast_and, expand, call_args
-from tritonize.data import Axis, TensorValue
+from tritonize.utils import TensorValue, ast_and, ast_invert, expand, call_args, ast_bin_op
+from tritonize.data import Axis
 from tritonize.tf import Renamer
 
 
@@ -26,7 +26,8 @@ class Node:
 
 
 def body_union(g: Context, bodies: List[List[ast.stmt]], masks: List[ast.expr],
-               unconditional_vars: Set[str], present_vars: Set[str]) -> List[ast.stmt]:
+               unconditional_vars: Set[str], present_vars: Set[str]) \
+        -> Tuple[List[ast.stmt], Dict[str, Union[TensorValue, bool]]]:
 
     # Prepare bodies, rejecting poorly initialized variables from merging
     ctrs = [
@@ -93,6 +94,7 @@ def body_union(g: Context, bodies: List[List[ast.stmt]], masks: List[ast.expr],
 
     # Try to combine multiple values with tl.where()
     result = []
+    var_types = {}
     for node in sequence:
         node.next.clear()
         target = node.target
@@ -118,9 +120,10 @@ def body_union(g: Context, bodies: List[List[ast.stmt]], masks: List[ast.expr],
             else:
                 assert isinstance(values, ast.expr)
                 value = values
+            var_types[target] = target in good_vars and getattr(value, 'value_type', True)
             statement = ast.Assign([ast.Name(target, ast.Store())], value)
         result.append(statement)
-    return result
+    return result, var_types
 
 
 class Tritonize(ast.NodeTransformer):
@@ -139,18 +142,20 @@ class Tritonize(ast.NodeTransformer):
         self.mask_index: int = 0
         self.mask = None
         self.axes = axes
-        self.axes_map = {str(a): i for i, a in enumerate(axes)}
 
     def visit_Name(self, node: ast.Name) -> Any:
         if (arg := self.args.get(node.id, None)) is not None:
             assert isinstance(node.ctx, ast.Load), 'Tensor argument reassignment not implemented'
             result = arg.ast_load()
-            setattr(result, self.type_attr, TensorValue(arg.axes_order))
+            setattr(result, self.type_attr, TensorValue(list(map(str, arg.axes_order))))
             setattr(result, self.var_attr, arg)
             setattr(result, self.fields_attr, [])
             return result
         if (val := self.local_vars.get(node.id, None)) is not None:
-            setattr(node, self.type_attr, val)
+            if val is False:
+                raise ValueError(f'Variable {node.id} is poorly initialized')
+            if isinstance(val, TensorValue):
+                setattr(node, self.type_attr, val)
             return node
         if node.id == self.g.tl:
             setattr(node, self.glob_attr, 'tl')
@@ -195,33 +200,20 @@ class Tritonize(ast.NodeTransformer):
             if (vt := getattr(arg, self.type_attr, False)) and isinstance(axis, ast.Constant):
                 axis = axis.value
                 if isinstance(axis, str):
+                    if other is not None and self.mask is not None:
+                        arg = self.g.ast_where(self.mask, arg, other)
+                        vt = getattr(arg, self.type_attr)
                     axes = list(map(str, vt.axes))
                     assert axis in axes, f'Unable to reduce by axis {axis} in {glob}'
                     axis = axes.index(axis)
-                    if other is not None and self.mask is not None:
-                        arg = self.g.ast_where(self.mask, arg, other)
                     node.args = [arg, ast.Constant(axis)]
                     node.keywords.clear()
                 assert isinstance(axis, int) and 0 <= axis < len(vt.axes)
-                vt.axes.pop(axis)
-                setattr(node, self.type_attr, vt)
+                setattr(node, self.type_attr, vt.without_axis(axis))
         return node
 
-    def broadcast(self, left: ast.expr, right: ast.expr) -> Tuple[ast.expr, ast.expr, Optional[TensorValue]]:
-        lt, rt = (getattr(a, self.type_attr) if hasattr(a, self.type_attr) else None for a in [left, right])
-        if lt is not None and rt is not None:
-            l_i, r_i = ([self.axes_map.get(str(axis)) for axis in t.axes] for t in [lt, rt])
-            f_i = sorted(set(l_i + r_i))
-            left = expand(left, [i not in l_i for i in f_i])
-            right = expand(right, [i not in r_i for i in f_i])
-            tv = TensorValue(list(map(self.axes.__getitem__, f_i)))
-        else:
-            tv = lt or rt
-        return left, right, tv
-
     def visit_BinOp(self, node: ast.BinOp) -> Any:
-        left, right, tv = self.broadcast(*map(self.visit, [node.left, node.right]))
-        node.left, node.right = left, right
+        tv, node.left, node.right = self.g.broadcast(*map(self.visit, [node.left, node.right]))
         if tv is not None:
             setattr(node, self.type_attr, tv)
         return node
@@ -231,7 +223,7 @@ class Tritonize(ast.NodeTransformer):
         comps = []
         tv = None
         for o in other:
-            left, o, tv = self.broadcast(left, o)
+            tv, left, o = self.g.broadcast(left, o)
             comps.append(o)
         node.left, node.comparators = left, comps
         if tv is not None:
@@ -247,8 +239,9 @@ class Tritonize(ast.NodeTransformer):
                     assert isinstance(l, ast.Call) and all(kw.arg != 'other' for kw in l.keywords)
                     l.keywords.append(ast.keyword('other', r))
                     return l
-        node.values = values
-        return node
+        return ast_bin_op(*values,
+                          op=ast.BitAnd() if isinstance(node.op, ast.And) else ast.BitOr(),
+                          axes_map=self.g.axes_map)
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> Any:
         node.operand = self.visit(node.operand)
@@ -292,29 +285,38 @@ class Tritonize(ast.NodeTransformer):
         else:
             return node
 
+    def visit_AugAssign(self, node: ast.AugAssign) -> Any:
+        src = copy(node.target)
+        assert isinstance(src, (ast.Name, ast.Subscript, ast.Attribute))
+        src.ctx = ast.Load()
+        return self.visit_Assign(ast.Assign([node.target], ast.BinOp(src, node.op, node.value)))
+
     def parse_if(self, node: ast.If, index: int) -> Generator[MaskedBody, None, None]:
         loc_mask = self.mask
         mask_id = 'mask' if loc_mask is None else loc_mask.id
         while True:
             loc_mask_id = self.g.new_name(f'{mask_id}_{index}')
             node_test = self.visit(node.test)
+            exp = node_test if loc_mask is None else ast_and(loc_mask, node_test, axes_map=self.g.axes_map)
             yield MaskedBody(
                 loc_mask_id,
-                node_test if loc_mask is None else ast_and(loc_mask, node_test),
+                exp,
                 node.body
             )
             loc_mask = ast.Name(loc_mask_id, ast.Load())
+            if t := getattr(exp, self.type_attr, False):
+                setattr(loc_mask, self.type_attr, t)
             if node.orelse:
                 e = node.orelse
                 if isinstance(e, list) and len(e) == 1 and isinstance(e[0], ast.If):
                     node = e[0]
-                    loc_mask = ast.UnaryOp(ast.Invert(), loc_mask)
+                    loc_mask = ast_invert(loc_mask)
                     index += 1
                     continue
                 else:
                     yield MaskedBody(
                         f'{mask_id}_{index + 1}',
-                        ast.UnaryOp(ast.Invert(), loc_mask),
+                        ast_invert(loc_mask),
                         e,
                         is_else=True
                     )
@@ -340,17 +342,14 @@ class Tritonize(ast.NodeTransformer):
                     if hasattr(b.test, self.type_attr):
                         setattr(m, self.type_attr, getattr(b.test, self.type_attr))
                     masks.append(m)
-                bodies, lvs = zip(*(  # TODO: Take new vars from body_union
+                bodies = [
                     self.replace_if(b.body, m, loc_vars)
                     for m, b in zip(masks, branches)
-                ))
+                ]
                 self.add_unconditional(b.mask_id for b in branches)
-                result.extend(body_union(self.g, list(bodies), masks, self.unconditional_vars, set(loc_vars)))
-                for lv in lvs:
-                    for var, tv in lv.items():
-                        if (t := loc_vars.get(var)) is not None:
-                            assert t == tv, f'Attempt to initialize {var} with different dims'
-                        loc_vars[var] = tv
+                body, var_types = body_union(self.g, list(bodies), masks, self.unconditional_vars, set(loc_vars))
+                result.extend(body)
+                loc_vars.update(var_types)
                 index += len(branches)
             else:
                 node = self.visit(node)
@@ -358,8 +357,8 @@ class Tritonize(ast.NodeTransformer):
                     loc_vars.update(getattr(node, 'new_vars'))
                 if node is not None:
                     result.append(node)
-        return result, loc_vars
+        return result
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
-        node.body = self.replace_if(node.body)[0]
+        node.body = self.replace_if(node.body)
         return node

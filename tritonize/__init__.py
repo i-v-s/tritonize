@@ -1,9 +1,9 @@
-from typing import Dict, List, Tuple, Any, Iterable, Set, Optional, Union
+from typing import Dict, List, Tuple, Iterable, Optional, Union
 from copy import copy
 
 import ast
-from ast import parse, get_source_segment, unparse
-from inspect import getclosurevars, getsource, getfullargspec, FullArgSpec
+from ast import parse
+from inspect import getsource, getfullargspec
 import linecache
 
 from .utils import ast_product, build_seq, scan_vars
@@ -174,6 +174,7 @@ def tritonize(save_to: Optional[str] = None,
                  no_mask=a in no_mask)
             for a in distribute_axes(f_anno, reduced_axes)
         ]
+        ctx.axes_map = {str(a): i for i, a in enumerate(axes)}
 
         tensor_args = {name: TensorArgument(name, tp.dimensions, axes, ctx, need_contiguous=tp.need_contiguous)
                        for name, tp in f_anno.items()

@@ -1,30 +1,102 @@
 import ast
-from typing import List, Set, Iterable, Union, Optional, Any
+from typing import NamedTuple, Dict, List, Set, Tuple, Iterable, Union, Optional, Any
 from collections import namedtuple
 
 
-def ast_bin_op(a1, *args, op=None):
+class TensorValue(NamedTuple):
+    axes: List[str]
+
+    def without_field(self, field: str):  # TODO: Implement
+        return TensorValue(self.axes)
+
+    def without_axis(self, axis: Union[str, int]):
+        if isinstance(axis, str):
+            return TensorValue([a for a in self.axes if a != axis])
+        elif isinstance(axis, int):
+            return TensorValue(self.axes[:axis] + self.axes[axis + 1:])
+        raise TypeError(f'Wrong axis type: {axis}')
+
+    def __str__(self):
+        return '(' + ', '.join(map(str, self.axes)) + ')'
+
+
+def expand(tensor: ast.expr, dims: List[bool]) -> ast.expr:
+    """
+    Expand tensor dimensions
+    :param tensor: tensor to expand
+    :param dims: list of dimensions, True for new dimension, False for existing
+    :return:
+    """
+    assert not all(dims), 'No existing dim specified'
+    if not any(dims):
+        return tensor
+    slices = [ast.Constant(None) if e else ast.Slice() for e in dims]
+    if len(slices) == 1:
+        sl = slices[0]
+    else:
+        sl = ast.Tuple(slices, ast.Load())
+    return ast.Subscript(tensor, sl, ast.Load())
+
+
+def expand_one(value: ast.expr, dim: int, total: int) -> ast.expr:
+    return expand(value, [i != dim for i in range(total)])
+
+
+def broadcast(*args: ast.expr, axes_map: Dict[str, int]) -> Tuple[Optional[TensorValue], ...]:
+    args: List[ast.expr] = list(args)
+    assert all(issubclass(a.__class__, ast.expr) for a in args)
+    indices = [
+        [axes_map.get(str(axis)) for axis in getattr(a, 'value_type').axes]
+        for a in args if hasattr(a, 'value_type')
+    ]
+    if indices:
+        f_i = sorted(set(sum(indices, [])))
+        if len(indices) > 1:
+            for i, ai in zip((i for i, a in enumerate(args) if hasattr(a, 'value_type')), indices):
+                args[i] = expand(args[i], [i not in ai for i in f_i])
+        inv_map = {v: k for k, v in axes_map.items()}
+        tv = TensorValue(list(map(inv_map.get, f_i)))
+    else:
+        tv = None
+    return tv, *args
+
+
+def ast_bin_op(a1, *args, op=None, axes_map: Optional[Dict[str, int]] = None):
+    if axes_map is not None:
+        rt, a1, *args = broadcast(a1, *args, axes_map=axes_map)
+    else:
+        rt = None
     if args:
         a2, *other = args
-        return ast_bin_op(ast.BinOp(a1, op, a2), *other, op=op)
+        result = ast_bin_op(ast.BinOp(a1, op, a2), *other, op=op)
     else:
-        return a1
+        result = a1
+    if rt is not None:
+        setattr(result, 'value_type', rt)
+    return result
 
 
-def ast_product(*factors):
-    return ast_bin_op(*factors, op=ast.Mult()) if factors else ast.Constant(1)
+def ast_product(*factors, **kwargs):
+    return ast_bin_op(*factors, op=ast.Mult(), **kwargs) if factors else ast.Constant(1)
 
 
-def ast_sum(*terms):
-    return ast_bin_op(*terms, op=ast.Add())
+def ast_sum(*terms, **kwargs):
+    return ast_bin_op(*terms, op=ast.Add(), **kwargs)
 
 
-def ast_and(*args):
-    return ast_bin_op(*args, op=ast.BitAnd())
+def ast_and(*args, **kwargs):
+    return ast_bin_op(*args, op=ast.BitAnd(), **kwargs)
 
 
 def ast_len(c):
     return ast.Call(ast.Name('len', ast.Load()), [c], [])
+
+
+def ast_invert(arg):
+    result = ast.UnaryOp(ast.Invert(), arg)
+    if t := getattr(arg, 'value_type', False):
+        setattr(result, 'value_type', t)
+    return result
 
 
 def none(*_) -> Any:
@@ -76,28 +148,6 @@ def ast_equals(a: Any, b: Any) -> bool:
     else:
         return a == b
     return True
-
-
-def expand(tensor: ast.expr, dims: List[bool]) -> ast.expr:
-    """
-    Expand tensor dimensions
-    :param tensor: tensor to expand
-    :param dims: list of dimensions, True for new dimension, False for existing
-    :return:
-    """
-    assert not all(dims), 'No existing dim specified'
-    if not any(dims):
-        return tensor
-    slices = [ast.Constant(None) if e else ast.Slice() for e in dims]
-    if len(slices) == 1:
-        sl = slices[0]
-    else:
-        sl = ast.Tuple(slices, ast.Load())
-    return ast.Subscript(tensor, sl, ast.Load())
-
-
-def expand_one(value: ast.expr, dim: int, total: int) -> ast.expr:
-    return expand(value, [i != dim for i in range(total)])
 
 
 def call_args(node: ast.Call, args: Union[str, List[str]], defaults: Optional[Iterable[Any]] = None):

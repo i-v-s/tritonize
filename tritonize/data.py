@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Set, Iterable, Optional, NamedTuple
+from typing import Dict, List, Tuple, Set, Iterable, Optional
 from itertools import count
 
 import ast
@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .utils import ast_len, ast_sum, ast_product, ast_and, ast_equals, expand_one
+from .utils import TensorValue, ast_len, ast_sum, ast_product, ast_and, ast_equals, expand_one, broadcast
 
 
 def name(v) -> Optional[str]:
@@ -66,6 +66,7 @@ class Context:
         self.tl = 'tl'
         self.triton = 'triton'
         self.torch = 'torch'
+        self.axes_map: Optional[Dict[str, int]] = None
         for k, v in self.globals.items():
             if v is triton:
                 self.triton = k
@@ -90,11 +91,18 @@ class Context:
     def ast_triton(self, attr):
         return ast.Attribute(ast.Name(self.triton, ast.Load()), attr, ast.Load())
 
+    def broadcast(self, *args):
+        return broadcast(*args, axes_map=self.axes_map)
+
     def ast_where(self, c, a, b):
         if ast_equals(a, b):
             return a
         else:
-            return ast.Call(self.ast_tl('where'), [c, a, b], [])
+            t, c, a, b = self.broadcast(c, a, b)
+            result = ast.Call(self.ast_tl('where'), [c, a, b], [])
+            if t is not None:
+                setattr(result, 'value_type', t)
+            return result
 
     def fold_where(self, values: List[Tuple[ast.expr, ast.expr]], otherwise: ast.AST):
         assert isinstance(values, list) and values
@@ -217,19 +225,6 @@ class Axis:
 
     def ast_grid_dim(self):
         return self.g.cdiv(self.ast_size(), self.ast_meta_block_size())
-
-
-class TensorValue(NamedTuple):
-    axes: List[Axis]
-
-    def without_field(self, field: str):  # TODO: Implement
-        return TensorValue(self.axes)
-
-    def without_axis(self, axis: Axis):
-        return TensorValue([a for a in self.axes if a is not axis])
-
-    def __str__(self):
-        return '(' + ', '.join(map(str, self.axes)) + ')'
 
 
 class TensorArgument:
@@ -361,7 +356,7 @@ class TensorArgument:
 
         if masks:
             self.mask = writer.init(f'{self.name}_m', ast_and(*masks)) if len(masks) > 1 else masks[0]
-            setattr(self.mask, 'value_type', TensorValue(axes))
+            setattr(self.mask, 'value_type', TensorValue(list(map(str, axes))))
 
     def ast_pointer(self, fields=None):
         result = self.value_p

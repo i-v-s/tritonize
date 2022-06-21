@@ -17,7 +17,9 @@ class Renamer(ast.NodeTransformer):
         if value := self.rename_map.get(node.id, False):
             node.id = value
         elif self.auto_add and isinstance(node.ctx, ast.Store):
-            node.id = self.rename_map[node.id] = self.ctx.new_name(node.id)
+            name = self.ctx.new_name(node.id)
+            self.rename_map[node.id] = name
+            node.id = name
         return node
 
     def visit_Return(self, node: ast.Return) -> Any:
